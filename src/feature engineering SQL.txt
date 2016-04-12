@@ -1,0 +1,2590 @@
+#----------------------------------------------------
+#----------------------------------------------------
+
+#GENENTECH CERVICAL CANCER SCREENING
+
+#FEATURE ENGINEERING
+
+#THE KAGGLE DATA IS LOADED INTO HIVE TABLES
+#IMPALA IS USED TO RUN ALL QUERIES
+
+#ALL THE INDIVIDUAL FEATURES ARE THEN AGGREGATED IN
+#A TRAIN AND TEST TABLE.
+
+#ADDITIONAL OHE FEATURES ARE SAVED INTO INDIVIDUAL
+#TABLES THAT NEED TO BE RUN THROUGH SCIKIT COUNTVECTORIZER
+#TO GENERATE DUMMY SPARSE FEATURES
+
+#----------------------------------------------------
+#----------------------------------------------------
+
+invalidate metadata;
+
+#new train after removal of excluded cases
+drop table patient_train_new purge;
+create table patient_train_new as
+select t1.*
+from genentech.patient_train as t1
+left join genentech.patient_train_excl as t2 on t1.patient_id=t2.patient_id
+where t2.patient_id is NULL
+
+#new test after removal of excluded cases
+drop table patient_test_new purge;
+create table patient_test_new as
+select t1.*
+from genentech.patient_test as t1
+left join genentech.patient_test_excl as t2 on t1.patient_id=t2.patient_id
+where t2.patient_id is NULL
+
+#----------------------------------------------------
+#----------------------------------------------------
+#REF TABLES
+#these tables relate each level of a categorical
+#variable to avg(is_screener)
+#----------------------------------------------------
+#----------------------------------------------------
+
+
+#prov
+drop table gj_ref_prov_all purge
+
+create table gj_ref_prov_all as /*rename g_ref_prov_all2 to g_ref_prov_all*/
+
+select primary_practitioner_id, avg(is_screener) as target, count(distinct patient_id) as cnt
+from (
+
+select t1.patient_id, t1.primary_practitioner_id, is_screener  
+ from (
+select distinct patient_id, primary_practitioner_id
+from  genentech.procedure_head
+UNION
+select distinct patient_id, attending_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+UNION
+select distinct patient_id, referring_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+UNION
+select distinct patient_id, ordering_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+UNION
+select distinct patient_id, rendering_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+UNION
+select distinct patient_id, operating_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+) as t1
+
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+and primary_practitioner_id <> ''
+
+  
+UNION
+select distinct t1.patient_id, primary_practitioner_id, is_screener
+from genentech.diagnosis_head as t1
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+and primary_practitioner_id <> ''
+  
+UNION
+select distinct t1.patient_id, practitioner_id as primary_practitioner_id, is_screener
+from genentech.surgical_head as t1
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+and practitioner_id <> ''
+  
+  
+) as t1
+group by 1
+having cnt>50
+
+#---
+/* DO I REALLY NEED THIS?????????????????????? NO EXECUTED*/
+create table g_ref_prov_all as
+select primary_practitioner_id, avg(is_screener) as target, count(distinct patient_id) as cnt
+from (
+select distinct t1.patient_id, primary_practitioner_id, is_screener
+from procedure_head as t1
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+and primary_practitioner_id <> ''
+UNION
+select distinct t1.patient_id, primary_practitioner_id, is_screener
+from diagnosis_head as t1
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+and primary_practitioner_id <> ''
+UNION
+select distinct t1.patient_id, practitioner_id as primary_practitioner_id, is_screener
+from surgical_head as t1
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+and practitioner_id <> ''
+) as t1
+group by 1
+having cnt>50
+
+#----------------------------------------------------
+#----------------------------------------------------
+#FEATURE ENGINEERING
+#----------------------------------------------------
+#----------------------------------------------------
+
+
+#----------------------------------------------------
+#RX DENSE
+#----------------------------------------------------
+
+drop table gj_feats_rx_head purge
+
+create table gj_feats_rx_head as
+select
+   patient_id as key_gj_feats_rx_head,
+   
+   count(*) as rx_clm_tot_count,
+   sum(days_supply) as rx_dos_tot_sum,  
+   sum(case when payment_type='COMMERCIAL' then 1 else 0 end) as rx_clm_count_paytypeCommercial,
+   sum(case when payment_type='MEDICARE' then 1 else 0 end) as rx_clm_count_paytypeMedicare,
+   sum(case when payment_type='MANAGED MEDICAID' then 1 else 0 end) as rx_clm_count_paytypeManagedMedicaid,
+   sum(case when payment_type='MEDICAID' then 1 else 0 end) as rx_clm_count_paytypeMedicaid,
+   sum(case when payment_type='CASH' then 1 else 0 end) as rx_clm_count_paytypeCash,
+   sum(case when payment_type='ASSISTANCE PROGRAMS' then 1 else 0 end) as rx_clm_count_paytypeAssistPrg,
+   
+   sum(case when payment_type='COMMERCIAL' then days_supply else 0 end) as rx_dos_sum_paytypeCommercial,
+   sum(case when payment_type='MEDICARE' then days_supply else 0 end) as rx_dos_sum_paytypeMedicare,
+   sum(case when payment_type='MANAGED MEDICAID' then days_supply else 0 end) as rx_dos_sum_paytypeManagedMedicaid,
+   sum(case when payment_type='MEDICAID' then days_supply else 0 end) as rx_dos_sum_paytypeMedicaid,
+   sum(case when payment_type='CASH' then days_supply else 0 end) as rx_dos_sum_paytypeCash,
+   sum(case when payment_type='ASSISTANCE PROGRAMS' then days_supply else 0 end) as rx_dos_sum_paytypeAssistPrg,
+   
+   max(cast(refill_code as int)) as rx_max_refills,
+   
+   count(distinct practitioner_id) as rx_doc_count
+   
+from genentech.prescription_head
+group by 1
+
+
+#----------------------------------------------------
+#SPECIALTY
+#----------------------------------------------------
+
+drop table gj_feats_spec;
+
+create table gj_feats_spec as
+select patient_id as key_gj_feats_spec,
+sum(case when specialty_description in (
+'NURSE MIDWIFE',
+'GYNECOLOGY',
+'MATERNAL AND FETAL MEDICINE',
+'OBSTETRICS AND GYNECOLOGY',
+'OBSTETRICS',
+'GYNECOLOGICAL ONCOLOGY',
+'REPRODUCTIVE ENDOCRINOLOGY',
+'ANATOMIC PATHOLOGY',
+'"PATHOLOGY') then 1 else 0 end) as spec_obgyn_clm_count
+
+from genentech.procedure_head as ph
+left join genentech.physicians as prov on prov.practitioner_id=ph.primary_practitioner_id
+group by patient_id
+
+#by spec
+drop table gj_feats_specialties purge;
+create table gj_feats_specialties as 
+select patient_id as key_gj_feats_specialties, 
+sum(case when specialty_description = 'PEDIATRICS DERMATOLOGY' then 1 else 0 end) as spec_PEDIATRICS_DERMATOLOGY, 
+sum(case when specialty_description = 'ENDOCRINOLOGY' then 1 else 0 end) as spec_ENDOCRINOLOGY,
+sum(case when specialty_description = 'OBSTETRICS' then 1 else 0 end) as spec_OBSTETRICS, 
+sum(case when specialty_description = '"INTERNAL MEDICINE' then 1 else 0 end) as spec__INTERNAL_MEDICINE, 
+sum(case when specialty_description = 'INTERNAL MEDICINE/MEDICAL GENETICS' then 1 else 0 end) as spec_INTERNAL_MEDICINE_MEDICAL_GENETICS, 
+sum(case when specialty_description = 'CHILD PSYCHIATRY' then 1 else 0 end) as spec_CHILD_PSYCHIATRY,
+sum(case when specialty_description = 'NUCLEAR RADIOLOGY' then 1 else 0 end) as spec_NUCLEAR_RADIOLOGY, 
+sum(case when specialty_description = '"FAMILY PRACTICE' then 1 else 0 end) as spec__FAMILY_PRACTICE,
+sum(case when specialty_description = 'UNKNOWN' then 1 else 0 end) as spec_UNKNOWN, 
+sum(case when specialty_description = 'MEDICAL TOXICOLOGY (PREVENTATIVE MEDICINE)' then 1 else 0 end) as spec_MEDICAL_TOXICOLOGY__PREVENTATIVE_MEDICINE_, 
+sum(case when specialty_description = 'PEDIATRIC ENDOCRINOLOGY' then 1 else 0 end) as spec_PEDIATRIC_ENDOCRINOLOGY, 
+sum(case when specialty_description = 'FORENSIC PSYCHIATRY' then 1 else 0 end) as spec_FORENSIC_PSYCHIATRY, 
+sum(case when specialty_description = 'UROLOGICAL SURGERY' then 1 else 0 end) as spec_UROLOGICAL_SURGERY, 
+sum(case when specialty_description = 'MEDICAL TOXICOLOGY(EM)' then 1 else 0 end) as spec_MEDICAL_TOXICOLOGY_EM_, 
+sum(case when specialty_description = 'ADOLESCENT MEDICINE (INTERNAL MEDICINE)' then 1 else 0 end) as spec_ADOLESCENT_MEDICINE__INTERNAL_MEDICINE_, 
+sum(case when specialty_description = '"ALLERGY/IMMUNOLOGY' then 1 else 0 end) as spec__ALLERGY_IMMUNOLOGY, 
+sum(case when specialty_description = 'GENERAL SURGERY' then 1 else 0 end) as spec_GENERAL_SURGERY, 
+sum(case when specialty_description = 'FLEXIBLE SPECIALTY (RESIDENTS ONLY)' then 1 else 0 end) as spec_FLEXIBLE_SPECIALTY__RESIDENTS_ONLY_,
+sum(case when specialty_description = 'PHARMACOLOGY' then 1 else 0 end) as spec_PHARMACOLOGY,
+sum(case when specialty_description = 'ANATOMIC PATHOLOGY' then 1 else 0 end) as spec_ANATOMIC_PATHOLOGY,
+sum(case when specialty_description = 'HEAD AND NECK SURGERY' then 1 else 0 end) as spec_HEAD_AND_NECK_SURGERY,
+sum(case when specialty_description = 'ORTHOPEDIC SURGERY OF THE SPINE' then 1 else 0 end) as spec_ORTHOPEDIC_SURGERY_OF_THE_SPINE, 
+sum(case when specialty_description = 'OTHER SPECIALTY' then 1 else 0 end) as spec_OTHER_SPECIALTY, 
+sum(case when specialty_description = '"NEUROPHYSIOLOGY' then 1 else 0 end) as spec__NEUROPHYSIOLOGY, 
+sum(case when specialty_description = 'NEONATAL-PERINATAL MEDICINE' then 1 else 0 end) as spec_NEONATAL_PERINATAL_MEDICINE, 
+sum(case when specialty_description = 'INTERNAL MEDICINE/EMERGENCY MEDICINE' then 1 else 0 end) as spec_INTERNAL_MEDICINE_EMERGENCY_MEDICINE, 
+sum(case when specialty_description = 'DERMATOLOGICAL DIAG LAB IMMUNOLOGY' then 1 else 0 end) as spec_DERMATOLOGICAL_DIAG_LAB_IMMUNOLOGY, 
+sum(case when specialty_description = 'OSTEOPATHIC MANIPULATIVE MEDICINE' then 1 else 0 end) as spec_OSTEOPATHIC_MANIPULATIVE_MEDICINE,
+sum(case when specialty_description = 'CLINICAL MOLECULAR GENETICS' then 1 else 0 end) as spec_CLINICAL_MOLECULAR_GENETICS,
+sum(case when specialty_description = 'DERMATOPATHOLOGY' then 1 else 0 end) as spec_DERMATOPATHOLOGY, 
+sum(case when specialty_description = 'PSYCHIATRY' then 1 else 0 end) as spec_PSYCHIATRY, 
+sum(case when specialty_description = '"ANESTHESIOLOGY' then 1 else 0 end) as spec__ANESTHESIOLOGY, 
+sum(case when specialty_description = 'PEDIATRICS/PHYSICAL MEDICINE AND REHABILITATION' then 1 else 0 end) as spec_PEDIATRICS_PHYSICAL_MEDICINE_AND_REHABILITATION, 
+sum(case when specialty_description = 'SELECTIVE PATHOLOGY' then 1 else 0 end) as spec_SELECTIVE_PATHOLOGY, 
+sum(case when specialty_description = 'PEDIATRIC EMERGENCY MEDICINE (EMERGENCY MEDICINE)' then 1 else 0 end) as spec_PEDIATRIC_EMERGENCY_MEDICINE__EMERGENCY_MEDICINE_,
+sum(case when specialty_description = 'ORTHOPEDIC SURGERY' then 1 else 0 end) as spec_ORTHOPEDIC_SURGERY, 
+sum(case when specialty_description = 'INTERNAL MEDICINE/PEDIATRICS' then 1 else 0 end) as spec_INTERNAL_MEDICINE_PEDIATRICS, 
+sum(case when specialty_description = 'NUTRITION' then 1 else 0 end) as spec_NUTRITION,
+sum(case when specialty_description = 'REPRODUCTIVE ENDOCRINOLOGY' then 1 else 0 end) as spec_REPRODUCTIVE_ENDOCRINOLOGY, 
+sum(case when specialty_description = 'SURGICAL ONCOLOGY' then 1 else 0 end) as spec_SURGICAL_ONCOLOGY,
+sum(case when specialty_description = 'INTERNAL MEDICINE' then 1 else 0 end) as spec_INTERNAL_MEDICINE, 
+sum(case when specialty_description = 'PULMONARY DISEASES' then 1 else 0 end) as spec_PULMONARY_DISEASES, 
+sum(case when specialty_description = 'DIAGNOSTIC RADIOLOGY' then 1 else 0 end) as spec_DIAGNOSTIC_RADIOLOGY, 
+sum(case when specialty_description = 'FORENSIC PATHOLOGY' then 1 else 0 end) as spec_FORENSIC_PATHOLOGY, 
+sum(case when specialty_description = 'GENERAL PRACTICE' then 1 else 0 end) as spec_GENERAL_PRACTICE, 
+sum(case when specialty_description = 'FAMILY MEDICINE' then 1 else 0 end) as spec_FAMILY_MEDICINE,
+sum(case when specialty_description = 'OTOLARYNGOLOGY' then 1 else 0 end) as spec_OTOLARYNGOLOGY, 
+sum(case when specialty_description = 'FAMILY PRACTICE' then 1 else 0 end) as spec_FAMILY_PRACTICE, 
+sum(case when specialty_description = 'NUCLEAR CARDIOLOGY' then 1 else 0 end) as spec_NUCLEAR_CARDIOLOGY, 
+sum(case when specialty_description = 'OBSTETRICS AND GYNECOLOGY' then 1 else 0 end) as spec_OBSTETRICS_AND_GYNECOLOGY 
+from genentech.procedure_head as ph
+left join genentech.physicians as prov on prov.practitioner_id=ph.primary_practitioner_id
+group by patient_id
+
+
+#----------------------------------------------------
+#TOP PROC CODES
+#----------------------------------------------------
+
+drop table gj_feats_top_procs purge;
+create table gj_feats_top_procs as /*changed from gj_top... to gj_feats_top...*/
+select patient_id as key_gj_feats_top_procs, 
+SUM(CASE WHEN procedure_code ='57456' then 1 else 0 end) as proc_57456,
+SUM(CASE WHEN procedure_code ='57455' then 1 else 0 end) as proc_57455,
+SUM(CASE WHEN procedure_code ='57454' then 1 else 0 end) as proc_57454,
+SUM(CASE WHEN procedure_code ='87850' then 1 else 0 end) as proc_87850,
+SUM(CASE WHEN procedure_code ='57460' then 1 else 0 end) as proc_57460,
+SUM(CASE WHEN procedure_code ='57421' then 1 else 0 end) as proc_57421,
+SUM(CASE WHEN procedure_code ='87592' then 1 else 0 end) as proc_87592,
+SUM(CASE WHEN procedure_code ='57452' then 1 else 0 end) as proc_57452,
+SUM(CASE WHEN procedure_code ='57461' then 1 else 0 end) as proc_57461,
+SUM(CASE WHEN procedure_code ='57511' then 1 else 0 end) as proc_57511,
+SUM(CASE WHEN procedure_code ='G0143' then 1 else 0 end) as proc_G0143,
+SUM(CASE WHEN procedure_code ='57522' then 1 else 0 end) as proc_57522,
+SUM(CASE WHEN procedure_code ='57520' then 1 else 0 end) as proc_57520,
+SUM(CASE WHEN procedure_code ='57505' then 1 else 0 end) as proc_57505,
+SUM(CASE WHEN procedure_code ='87512' then 1 else 0 end) as proc_87512,
+SUM(CASE WHEN procedure_code ='57420' then 1 else 0 end) as proc_57420,
+SUM(CASE WHEN procedure_code ='87530' then 1 else 0 end) as proc_87530,
+SUM(CASE WHEN procedure_code ='80055' then 1 else 0 end) as proc_80055,
+SUM(CASE WHEN procedure_code ='87149' then 1 else 0 end) as proc_87149,
+SUM(CASE WHEN procedure_code ='H1002' then 1 else 0 end) as proc_H1002,
+SUM(CASE WHEN procedure_code ='56820' then 1 else 0 end) as proc_56820,
+SUM(CASE WHEN procedure_code ='87110' then 1 else 0 end) as proc_87110,
+SUM(CASE WHEN procedure_code ='H1003' then 1 else 0 end) as proc_H1003,
+SUM(CASE WHEN procedure_code ='S5190' then 1 else 0 end) as proc_S5190,
+SUM(CASE WHEN procedure_code ='86777' then 1 else 0 end) as proc_86777,
+SUM(CASE WHEN procedure_code ='86778' then 1 else 0 end) as proc_86778,
+SUM(CASE WHEN procedure_code ='86696' then 1 else 0 end) as proc_86696,
+SUM(CASE WHEN procedure_code ='81243' then 1 else 0 end) as proc_81243,
+SUM(CASE WHEN procedure_code ='86762' then 1 else 0 end) as proc_86762,
+SUM(CASE WHEN procedure_code ='82950' then 1 else 0 end) as proc_82950,
+SUM(CASE WHEN procedure_code ='S9560' then 1 else 0 end) as proc_S9560,
+SUM(CASE WHEN procedure_code ='86695' then 1 else 0 end) as proc_86695,
+SUM(CASE WHEN procedure_code ='82677' then 1 else 0 end) as proc_82677,
+SUM(CASE WHEN procedure_code ='86336' then 1 else 0 end) as proc_86336,
+SUM(CASE WHEN procedure_code ='01966' then 1 else 0 end) as proc_01966,
+SUM(CASE WHEN procedure_code ='88365' then 1 else 0 end) as proc_88365,
+SUM(CASE WHEN procedure_code ='59610' then 1 else 0 end) as proc_59610,
+SUM(CASE WHEN procedure_code ='87660' then 1 else 0 end) as proc_87660,
+SUM(CASE WHEN procedure_code ='86781' then 1 else 0 end) as proc_86781,
+SUM(CASE WHEN procedure_code ='87510' then 1 else 0 end) as proc_87510,
+SUM(CASE WHEN procedure_code ='87480' then 1 else 0 end) as proc_87480,
+SUM(CASE WHEN procedure_code ='87661' then 1 else 0 end) as proc_87661,
+SUM(CASE WHEN procedure_code ='86703' then 1 else 0 end) as proc_86703
+from genentech.procedure_head 
+group by patient_id
+
+#summarized
+drop table gj_feats_top_procs_all purge;
+create table gj_feats_top_procs_all as
+select patient_id as key_gj_feats_top_procs_all, 
+count(*) as procs_top_all
+from genentech.procedure_head
+where procedure_code in 
+('57456','57455','57454','87850','57460','57421','87592','57452','57461','57511','G0143','57522','57520',
+ '57505','87512','57420','87530','80055','87149','H1002','56820','87110','H1003','S5190','86777','86778',
+ '86696','81243','86762','82950','S9560','86695','82677','86336','01966','88365','59610','87660','86781',
+ '87510','87480','87661','86703','57500','87109','82120','83901','87529','87590','87390','58301','87481',
+ 'J2675','81220','59840','83914','J7300','87591','56501','87491','99395','87653','86701','86694','87800',
+ '86765','57061','87255','81007','83900','81290','82952','87490','87511','84704','86735','81260','86780',
+ '81209','86787','J7302','Q0112','87905','58605','81251','81511','58300','86631','81255','81200','57150',
+ '81330','86592','58100','87341','0503F','01960','59400','86886','87901','Q0111','0500F','64435','87536',
+ '57800','56515','58565','59426','84163','83909','86747','83719','99385','85660','82105','82951')
+
+group by patient_id
+
+
+#----------------------------------------------------
+#TOP DX CODES
+#----------------------------------------------------
+
+drop table gj_feats_top_dx purge;
+create table gj_feats_top_dx as
+select patient_id as key_gj_feats_top_dx, 
+SUM(CASE WHEN diagnosis_code ='795.07' then 1 else 0 end) as dx_79507,
+SUM(CASE WHEN diagnosis_code ='795.13' then 1 else 0 end) as dx_79513,
+SUM(CASE WHEN diagnosis_code ='622.11' then 1 else 0 end) as dx_62211,
+SUM(CASE WHEN diagnosis_code ='795.11' then 1 else 0 end) as dx_79511,
+SUM(CASE WHEN diagnosis_code ='622.12' then 1 else 0 end) as dx_62212,
+SUM(CASE WHEN diagnosis_code ='079.4' then 1 else 0 end) as dx_0794,
+SUM(CASE WHEN diagnosis_code ='V67.01' then 1 else 0 end) as dx_V6701,
+SUM(CASE WHEN diagnosis_code ='795.08' then 1 else 0 end) as dx_79508,
+SUM(CASE WHEN diagnosis_code ='V13.22' then 1 else 0 end) as dx_V1322,
+SUM(CASE WHEN diagnosis_code ='795.00' then 1 else 0 end) as dx_79500,
+SUM(CASE WHEN diagnosis_code ='233.1' then 1 else 0 end) as dx_2331,
+SUM(CASE WHEN diagnosis_code ='V76.47' then 1 else 0 end) as dx_V7647,
+SUM(CASE WHEN diagnosis_code ='622.10' then 1 else 0 end) as dx_62210,
+SUM(CASE WHEN diagnosis_code ='795.10' then 1 else 0 end) as dx_79510,
+SUM(CASE WHEN diagnosis_code ='623.0' then 1 else 0 end) as dx_6230,
+SUM(CASE WHEN diagnosis_code ='219.0' then 1 else 0 end) as dx_2190,
+SUM(CASE WHEN diagnosis_code ='V73.88' then 1 else 0 end) as dx_V7388,
+SUM(CASE WHEN diagnosis_code ='622.0' then 1 else 0 end) as dx_6220,
+SUM(CASE WHEN diagnosis_code ='V75.8' then 1 else 0 end) as dx_V758,
+SUM(CASE WHEN diagnosis_code ='622.9' then 1 else 0 end) as dx_6229,
+SUM(CASE WHEN diagnosis_code ='V72.31' then 1 else 0 end) as dx_V7231,
+SUM(CASE WHEN diagnosis_code ='V73.98' then 1 else 0 end) as dx_V7398,
+SUM(CASE WHEN diagnosis_code ='622.8' then 1 else 0 end) as dx_6228,
+SUM(CASE WHEN diagnosis_code ='V25.13' then 1 else 0 end) as dx_V2513,
+SUM(CASE WHEN diagnosis_code ='V65.44' then 1 else 0 end) as dx_V6544,
+SUM(CASE WHEN diagnosis_code ='V28.6' then 1 else 0 end) as dx_V286,
+SUM(CASE WHEN diagnosis_code ='V61.7' then 1 else 0 end) as dx_V617,
+SUM(CASE WHEN diagnosis_code ='654.63' then 1 else 0 end) as dx_65463,
+SUM(CASE WHEN diagnosis_code ='622.7' then 1 else 0 end) as dx_6227,
+SUM(CASE WHEN diagnosis_code ='V28.5' then 1 else 0 end) as dx_V285,
+SUM(CASE WHEN diagnosis_code ='V24.2' then 1 else 0 end) as dx_V242,
+SUM(CASE WHEN diagnosis_code ='V28.9' then 1 else 0 end) as dx_V289,
+SUM(CASE WHEN diagnosis_code ='V28.1' then 1 else 0 end) as dx_V281,
+SUM(CASE WHEN diagnosis_code ='V26.29' then 1 else 0 end) as dx_V2629,
+SUM(CASE WHEN diagnosis_code ='V26.41' then 1 else 0 end) as dx_V2641,
+SUM(CASE WHEN diagnosis_code ='V26.49' then 1 else 0 end) as dx_V2649,
+SUM(CASE WHEN diagnosis_code ='V23.3' then 1 else 0 end) as dx_V233,
+SUM(CASE WHEN diagnosis_code ='V25.1' then 1 else 0 end) as dx_V251,
+SUM(CASE WHEN diagnosis_code ='648.10' then 1 else 0 end) as dx_64810,
+SUM(CASE WHEN diagnosis_code ='646.30' then 1 else 0 end) as dx_64630,
+SUM(CASE WHEN diagnosis_code ='616.9' then 1 else 0 end) as dx_6169,
+SUM(CASE WHEN diagnosis_code ='V26.9' then 1 else 0 end) as dx_V269,
+SUM(CASE WHEN diagnosis_code ='V77.6' then 1 else 0 end) as dx_V776,
+SUM(CASE WHEN diagnosis_code ='V74.5' then 1 else 0 end) as dx_V745,
+SUM(CASE WHEN diagnosis_code ='626.7' then 1 else 0 end) as dx_6267,
+SUM(CASE WHEN diagnosis_code ='078.88' then 1 else 0 end) as dx_07888,
+SUM(CASE WHEN diagnosis_code ='V73.99' then 1 else 0 end) as dx_V7399,
+SUM(CASE WHEN diagnosis_code ='V25.42' then 1 else 0 end) as dx_V2542,
+SUM(CASE WHEN diagnosis_code ='V28.0' then 1 else 0 end) as dx_V280,
+SUM(CASE WHEN diagnosis_code ='V73.2' then 1 else 0 end) as dx_V732,
+SUM(CASE WHEN diagnosis_code ='V22.1' then 1 else 0 end) as dx_V221,
+SUM(CASE WHEN diagnosis_code ='628.0' then 1 else 0 end) as dx_6280,
+SUM(CASE WHEN diagnosis_code ='V25.12' then 1 else 0 end) as dx_V2512,
+SUM(CASE WHEN diagnosis_code ='V26.31' then 1 else 0 end) as dx_V2631,
+SUM(CASE WHEN diagnosis_code ='652.93' then 1 else 0 end) as dx_65293,
+SUM(CASE WHEN diagnosis_code ='658.93' then 1 else 0 end) as dx_65893,
+SUM(CASE WHEN diagnosis_code ='V73.3' then 1 else 0 end) as dx_V733,
+SUM(CASE WHEN diagnosis_code ='V23.9' then 1 else 0 end) as dx_V239,
+SUM(CASE WHEN diagnosis_code ='V28.8' then 1 else 0 end) as dx_V288,
+SUM(CASE WHEN diagnosis_code ='219.1' then 1 else 0 end) as dx_2191,
+SUM(CASE WHEN diagnosis_code ='V65.45' then 1 else 0 end) as dx_V6545,
+SUM(CASE WHEN diagnosis_code ='642.23' then 1 else 0 end) as dx_64223,
+SUM(CASE WHEN diagnosis_code ='659.60' then 1 else 0 end) as dx_65960,
+SUM(CASE WHEN diagnosis_code ='V76.49' then 1 else 0 end) as dx_V7649,
+SUM(CASE WHEN diagnosis_code ='642.00' then 1 else 0 end) as dx_64200,
+SUM(CASE WHEN diagnosis_code ='V28.4' then 1 else 0 end) as dx_V284
+from genentech.diagnosis_head
+group by patient_id
+
+
+drop table gj_feats_top_dx_all purge;
+create table gj_feats_top_dx_all as
+select patient_id as key_gj_feats_top_dx_all, 
+count(*) as dx_top_all
+from genentech.diagnosis_head
+where diagnosis_code in 
+('795.07','795.13','622.11','795.11','622.12','079.4','V67.01','795.08','V13.22','795.00','233.1','V76.47',
+ '622.10','795.10','623.0','219.0','V73.88','622.0','V75.8','622.9','V72.31','V73.98','622.8','V25.13','V65.44',
+ 'V28.6','V61.7','654.63','622.7','V28.5','V24.2','V28.9','V28.1','V26.29','V26.41','V26.49','V23.3','V25.1',
+ '648.10','646.30','616.9','V26.9','V77.6','V74.5','626.7','078.88','V73.99','V25.42','V28.0','V73.2','V22.1',
+ '628.0','V25.12','V26.31','652.93','658.93','V73.3','V23.9','V28.8','219.1','V65.45','642.23','659.60',
+ 'V76.49','642.00','V28.4','658.83','624.01','V01.6','V23.82','078.11','V23.81','659.43','648.80','V89.05',
+ '676.90','616.0','V23.41','V73.89','642.90','V61.5','V23.49','654.61','V89.02','640.00','V24.0','641.90',
+ '652.33','667.10','647.63','654.20','628.8','V23.5','V23.2','V76.46','V28.89','098.0','099.9','652.03','V12.21'
+ ,'656.93','655.43','V23.89','621.9','649.33','646.33','V28.2','622.5','V25.11','V23.87','V72.42','646.60',
+ 'V26.89','233.32','V91.03','644.20','615.1','648.00','637.90','V22.2','996.32','221.2','633.80','654.53',
+ '615.0','V26.1','629.9','616.10'
+)
+
+group by patient_id
+
+#----------------------------------------------------
+#LEAKAGE
+#----------------------------------------------------
+
+#find claims where some lines appear to be missing,
+#this might be an indicator of records highly correlated
+#to the target having been removed by Genentech
+create table gj_lk as
+select patient_id, claim_id,
+count(*) as n_records,
+max(cast(claim_line_item as int)) as max_clm_ln,
+count(*)-max(cast(claim_line_item as int)) as clm_diff
+from genentech.procedure_head
+group by patient_id, claim_id
+having clm_diff <0
+
+#run in Hive
+drop table gj_feats_leak_det purge;
+create table gj_feats_leak_det as
+select t1.patient_id as key_gj_feats_leak_det,
+count(distinct case when specialty_description ='NURSE MIDWIFE' then t1.claim_id end) as miss_spec_NURSEMIDWIFE,
+count(distinct case when specialty_description ='OBSTETRICS AND GYNECOLOGY' then t1.claim_id end) as miss_spec_OBSTETRICSANDGYNECOLOGY,
+count(distinct case when specialty_description ='MATERNAL AND FETAL MEDICINE' then t1.claim_id end) as miss_spec_MATERNALANDFETALMEDICINE,
+count(distinct case when specialty_description ='OBSTETRICS' then t1.claim_id end) as miss_spec_OBSTETRICS,
+count(distinct case when specialty_description ='GYNECOLOGY' then t1.claim_id end) as miss_spec_GYNECOLOGY,
+count(distinct case when specialty_description ='REPRODUCTIVE ENDOCRINOLOGY' then t1.claim_id end) as miss_spec_REPRODUCTIVEENDOCRINOLOGY,
+count(distinct case when specialty_description ='MEDICAL GENETICS' then t1.claim_id end) as miss_spec_MEDICALGENETICS,
+count(distinct case when specialty_description ='GYNECOLOGICAL ONCOLOGY' then t1.claim_id end) as miss_spec_GYNECOLOGICALONCOLOGY
+from genentech.procedure_head as t1
+inner join gj_lk as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+group by t1.patient_id
+
+
+drop table gj_feats_leak_all purge;
+create table gj_feats_leak_all as
+select t1.patient_id as key_gj_feats_leak_all,
+count(distinct t1.claim_id) as miss_spec_all
+from genentech.procedure_head as t1
+inner join gj_lk as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+where specialty_description in ('OBSTETRICS AND GYNECOLOGY','MATERNAL AND FETAL MEDICINE','OBSTETRICS',
+                                'GYNECOLOGY','REPRODUCTIVE ENDOCRINOLOGY','MEDICAL GENETICS','GYNECOLOGICAL ONCOLOGY')
+group by t1.patient_id
+
+#across claim---------------
+
+#proc
+create table gj_lk_ref_across as
+select t2.procedure_code, avg(is_screener) as target, count(distinct t1.patient_id) as c
+from gj_lk as t1
+inner join genentech.procedure_head as t2 on t1.claim_id=t2.claim_id
+inner join genentech.patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+#dx
+create table gj_lk_dx_ref_across as
+select t2.diagnosis_code, avg(is_screener) as target, count(distinct t1.patient_id) as c
+from gj_lk as t1
+inner join genentech.diagnosis_head as t2 on t1.claim_id=t2.claim_id
+inner join genentech.patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+
+#procedures/dx across
+drop table gj_feats_leak_across purge
+create table gj_feats_leak_across as
+select patient_id as key_gj_feats_leak_across,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_97,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_95,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_70,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_60,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_50,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_40,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_30,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_20,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_10,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_00,
+
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_97,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_95,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_70,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_60,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_50,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_40,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_30,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_20,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_10,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_00,
+
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m,
+max(target) as max_leak_trg,
+min(target) as min_leak_trg,
+avg(target) as avg_leak_trg
+
+from (
+  select t1.patient_id, t3.procedure_code as code, t2.target, t2.c
+  from gj_lk as t1
+  inner join genentech.procedure_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_ref_across as t2 on t3.procedure_code=t2.procedure_code
+  where c>50
+  UNION
+  select t1.patient_id, t3.diagnosis_code as code, t2.target, t2.c
+  from gj_lk as t1
+  inner join genentech.diagnosis_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_dx_ref_across as t2 on t3.diagnosis_code=t2.diagnosis_code
+  where c>50
+  
+
+  ) as z
+group by 1
+
+#across claim: by claim_type---------------
+drop table gj_double_leak purge
+create table gj_double_leak as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_ref_across as b
+
+inner join(
+select procedure_code, claim_type, avg(is_screener) as targetD, count(distinct t1.patient_id) as cntD
+
+from gj_lk as t1
+inner join genentech.procedure_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.procedure_code=b.procedure_code
+
+drop table gj_double_leak2 purge
+create table gj_double_leak2 as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_dx_ref_across as b
+
+inner join(
+select diagnosis_code, claim_type, avg(is_screener) as targetD, count(distinct t1.patient_id) as cntD
+
+from gj_lk as t1
+inner join genentech.diagnosis_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.diagnosis_code=b.diagnosis_code
+
+
+create table gj_lk_ct_patient as 
+select t1.patient_id, t1.claim_id, t1.claim_type, t1.procedure_code as code, targetD as target, cntD as cnt
+  from genentech.procedure_head as t1
+  inner join gj_lk as t2 on t1.claim_id=t2.claim_id
+  inner join gj_double_leak as t3 on t1.procedure_code=t3.procedure_code and t1.claim_type=t3.claim_type
+  
+  UNION
+  
+  select t1.patient_id, t1.claim_id, t1.claim_type, t1.diagnosis_code as code, targetD as target, cntD as cnt
+  from genentech.diagnosis_head as t1
+  inner join gj_lk as t2 on t1.claim_id=t2.claim_id
+  inner join gj_double_leak2 as t3 on t1.diagnosis_code=t3.diagnosis_code and t1.claim_type=t3.claim_type
+
+#procedures/dx across
+drop table gj_feats_leak_across_ct purge
+create table gj_feats_leak_across_ct as
+select patient_id as key_gj_feats_leak_across_ct,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_97_ct,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_95_ct,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_90_ct,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_85_ct,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_80_ct,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_75_ct,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_70_ct,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_60_ct,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_50_ct,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_40_ct,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_30_ct,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_20_ct,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_10_ct,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_00_ct,
+
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_97_ct,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_95_ct,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_90_ct,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_85_ct,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_80_ct,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_75_ct,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_70_ct,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_60_ct,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_50_ct,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_40_ct,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_30_ct,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_20_ct,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_10_ct,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_00_ct,
+
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m_ct,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m_ct,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m_ct,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m_ct,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m_ct,
+max(target) as max_leak_trg_ct,
+min(target) as min_leak_trg_ct,
+avg(target) as avg_leak_trg_ct
+
+from gj_lk_ct_patient as z
+  where z.cnt>50
+group by 1
+
+#leakage proc spec
+create table gj_ref_lk_spec_cpt as
+select specialty_description, procedure_code,avg(is_Screener) as target, count(distinct t1.patient_id) as cnt
+from genentech.procedure_head as t1
+inner join gj_lk as tt on tt.claim_id=t1.claim_id
+inner join patient_train_new as t3 on t1.patient_id=t3.patient_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+group by 1,2
+
+
+create table gj_ref_lk_spec_cpt_rank as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_lk_spec_cpt
+ 
+
+drop table gj_ref_lk_spec_cpt_patient purge
+create table gj_ref_lk_spec_cpt_patient as
+select distinct b.*, t4.target, t4.cnt, t4.code
+from (
+select distinct t1.patient_id, specialty_description, procedure_code
+from genentech.procedure_head as t1
+inner join gj_lk as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id) as b
+inner join gj_ref_lk_spec_cpt_rank as t4 on t4.procedure_code=b.procedure_code and
+t4.specialty_description=b.specialty_description
+where cnt>50
+
+drop table gj_feats_leak_specproc purge
+create table gj_feats_leak_specproc as
+select patient_id as key_gj_feats_leak_specproc,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_specproc_97,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_specproc_95,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_specproc_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_specproc_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_specproc_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_specproc_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_specproc_70,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_specproc_00,
+max(CASE when target>0.97 then target else 0 end) as m_leak_specproc_97,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_specproc_95,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_specproc_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_specproc_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_specproc_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_specproc_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_specproc_70,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_specproc_00,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_specproc_90m,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_specproc_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_specproc_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_specproc_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_specproc_70m,
+max(target) as max_leak_specproc,
+min(target) as min_leak_specproc,
+avg(target) as avg_leak_specproc
+from gj_ref_lk_spec_cpt_patient
+where cnt>50
+group by 1
+
+#----------------------------------------------------
+# LEAKAGE ACROSS SAME DATE CLAIMS
+#----------------------------------------------------
+
+create table gj_lk_addday as
+select t1.patient_id, t1.claim_id, t2.procedure_date
+from gj_lk as t1
+inner join genentech.procedure_head as t2 on t1.claim_id=t2.claim_id
+
+
+drop table gj_lk_sameday purge
+create table gj_lk_sameday as
+select * from
+(
+select distinct t1.patient_id, t1.claim_id, t1.procedure_code
+from genentech.procedure_head as t1
+inner join gj_lk_addday as t2 on t1.patient_id=t2.patient_id
+and t1.procedure_date=t2.procedure_date
+  ) as t1
+where t1.claim_id not in (select distinct claim_id from gj_lk)
+
+
+create table gj_lk_ref_sameday as
+select t2.procedure_code, avg(is_screener) as target, count(distinct t1.patient_id) as c
+from gj_lk_sameday as t1
+inner join genentech.procedure_head as t2 on t1.claim_id=t2.claim_id
+inner join patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+
+#summarize
+drop table gj_feats_leak_sd purge
+create table gj_feats_leak_sd as
+select patient_id as key_gj_feats_leak_sd,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_sd_97,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_sd_95,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_sd_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_sd_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_sd_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_sd_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_sd_70,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_sd_00,
+max(CASE when target>0.97 then target else 0 end) as m_leak_sd_97,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_sd_95,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_sd_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_sd_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_sd_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_sd_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_sd_70,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_sd_00,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_sd_90m,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_sd_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_sd_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_sd_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_sd_70m,
+max(target) as max_leak_sd,
+min(target) as min_leak_sd,
+avg(target) as avg_leak_sd
+from gj_lk_sameday as t1
+inner join gj_lk_ref_sameday as t2 on t1.procedure_code=t2.procedure_code
+and c>50
+group by 1
+
+#----------------------------------------------------
+#PROC_DX
+#----------------------------------------------------
+
+create table gj_feats_cptdx2 as
+select p.patient_id, p.claim_id, procedure_code,diagnosis_code, is_screener
+from genentech.procedure_head as p
+inner join genentech.diagnosis_head as d on p.claim_id=d.claim_id
+inner join patient_train_new as b on b.patient_id=p.patient_id
+
+
+drop table gj_feats_cptdx2all purge
+create table gj_feats_cptdx2all as
+select p.patient_id, p.claim_id, procedure_code,diagnosis_code,charge_amount
+from genentech.procedure_head as p
+inner join genentech.diagnosis_head as d on p.claim_id=d.claim_id
+
+
+create table gj_feats_cptdx2agg as
+select procedure_code, diagnosis_code, avg(is_screener) as c, count(distinct patient_id) as s
+from gj_feats_cptdx2
+group by 1,2
+having s>50 /*changed from 100 to 50*/
+
+
+drop table gj_feats_procdx_grouped purge
+create table gj_feats_procdx_grouped as
+select
+patient_id as key_gj_feats_procdx_grouped,
+SUM(case when t2.c>0.99 then 1 else 0 end) as procdx_99,
+SUM(case when t2.c between 0.97 and 0.99 then 1 else 0 end) as procdx_97,
+SUM(case when t2.c between 0.95 and 0.97 then 1 else 0 end) as procdx_95,
+SUM(case when t2.c between 0.9 and 0.95 then 1 else 0 end) as procdx_90,
+SUM(case when t2.c between 0.85 and 0.9 then 1 else 0 end) as procdx_85,
+SUM(case when t2.c between 0.8 and 0.85 then 1 else 0 end) as procdx_80,
+SUM(case when t2.c between 0.75 and 0.8 then 1 else 0 end) as procdx_75,
+SUM(case when t2.c between 0.7 and 0.75 then 1 else 0 end) as procdx_70,
+SUM(case when t2.c>0.9 then 1 else 0 end) as procdx_90t,
+SUM(case when t2.c>0.85 then 1 else 0 end) as procdx_85t,
+SUM(case when t2.c>0.8 then 1 else 0 end) as procdx_80t,
+SUM(case when t2.c>0.75 then 1 else 0 end) as procdx_75t,
+SUM(case when t2.c>0.7 then 1 else 0 end) as procdx_70t,
+SUM(case when t2.c>0.99 then charge_amount else 0 end) as procdx_99d,
+SUM(case when t2.c between 0.97 and 0.99 then charge_amount else 0 end) as procdx_97d,
+SUM(case when t2.c between 0.95 and 0.97 then charge_amount else 0 end) as procdx_95d,
+SUM(case when t2.c between 0.9 and 0.95 then charge_amount else 0 end) as procdx_90d,
+SUM(case when t2.c between 0.85 and 0.9 then charge_amount else 0 end) as procdx_85d,
+SUM(case when t2.c between 0.8 and 0.85 then charge_amount else 0 end) as procdx_80d,
+SUM(case when t2.c between 0.75 and 0.8 then charge_amount else 0 end) as procdx_75d,
+SUM(case when t2.c between 0.7 and 0.75 then charge_amount else 0 end) as procdx_70d,
+SUM(case when t2.c>0.9 then charge_amount else 0 end) as procdx_90td,
+SUM(case when t2.c>0.85 then charge_amount else 0 end) as procdx_85td,
+SUM(case when t2.c>0.8 then charge_amount else 0 end) as procdx_80td,
+SUM(case when t2.c>0.75 then charge_amount else 0 end) as procdx_75td,
+SUM(case when t2.c>0.7 then charge_amount else 0 end) as procdx_70td
+from gj_feats_cptdx2all as t1
+inner join gj_feats_cptdx2agg as t2 on t1.diagnosis_code=t2.diagnosis_code and t1.procedure_code=t2.procedure_code
+where t2.c>0.70 and t2.s>50
+group by patient_id
+
+
+#----------------------------------------------------
+#TARGET BASED DISTRIBUTIONS
+#----------------------------------------------------
+
+drop table gj_feats_targetdist  purge
+create table gj_feats_targetdist as
+select b.patient_id, b.surgical_code as code, r.cnt, r.target, 'S' as type
+from genentech.surgical_head as b
+inner join gj_ref_surg_all as r on r.surgical_code=b.surgical_code
+where cnt>50
+UNION
+select b.patient_id, b.diagnosis_code as code, r.cnt, r.target, 'D' as type
+from genentech.diagnosis_head as b
+inner join gj_ref_dx_all as r on r.diagnosis_code=b.diagnosis_code
+where cnt>50
+UNION
+select b.patient_id, b.procedure_code as code, r.cnt, r.target, 'P' as type
+from genentech.procedure_head as b
+inner join gj_ref_proc_all as r on r.procedure_code=b.procedure_code
+where cnt>50
+
+drop table gj_feats_target purge
+create table gj_feats_target as
+select patient_id as key_gj_feats_target,
+
+sum(CASE when target>0.9 then 1 else 0 end) as n_trg_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_trg_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_trg_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_trg_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_trg_70,
+sum(CASE when target between 0.60 and 0.7 then 1 else 0 end) as n_trg_60,
+sum(CASE when target between 0.5 and 0.6 then 1 else 0 end) as n_trg_50,
+sum(CASE when target between 0.4 and 0.5 then 1 else 0 end) as n_trg_40,
+sum(CASE when target between 0.3 and 0.4 then 1 else 0 end) as n_trg_30,
+sum(CASE when target between 0.2 and 0.3 then 1 else 0 end) as n_trg_20,
+sum(CASE when target between 0.1 and 0.2 then 1 else 0 end) as n_trg_10,
+sum(CASE when target < 0.10 then 1 else 0 end) as n_trg_00,
+max(CASE when target>0.9 then target else 0 end) as m_trg_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_trg_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_trg_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_trg_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_trg_70,
+max(CASE when target between 0.60 and 0.7 then target else 0 end) as m_trg_60,
+max(CASE when target between 0.5 and 0.6 then target else 0 end) as m_trg_50,
+max(CASE when target between 0.4 and 0.5 then target else 0 end) as m_trg_40,
+max(CASE when target between 0.3 and 0.4 then target else 0 end) as m_trg_30,
+max(CASE when target between 0.2 and 0.3 then target else 0 end) as m_trg_20,
+max(CASE when target between 0.1 and 0.2 then target else 0 end) as m_trg_10,
+max(CASE when target < 0.10 then target else 0 end) as m_trg_00,
+max(target) as max_trg,
+min(target) as min_trg,
+avg(target) as avg_trg
+from gj_feats_targetdist
+group by 1
+
+
+#----------------------------------------------------
+#PROVIDER
+#----------------------------------------------------
+
+
+drop table gj_feats_provs purge
+create table gj_feats_provs as
+select t1.patient_id as key_gj_feats_provs,
+sum(CASE when target>0.9 then 1 else 0 end) as n_prov_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_prov_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_prov_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_prov_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_prov_70,
+sum(CASE when target between 0.60 and 0.7 then 1 else 0 end) as n_prov_60,
+sum(CASE when target between 0.5 and 0.6 then 1 else 0 end) as n_prov_50,
+sum(CASE when target between 0.4 and 0.5 then 1 else 0 end) as n_prov_40,
+sum(CASE when target between 0.3 and 0.4 then 1 else 0 end) as n_prov_30,
+sum(CASE when target between 0.2 and 0.3 then 1 else 0 end) as n_prov_20,
+sum(CASE when target between 0.1 and 0.2 then 1 else 0 end) as n_prov_10,
+sum(CASE when target < 0.10 then 1 else 0 end) as n_prov_00,
+max(CASE when target>0.9 then target else 0 end) as m_prov_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_prov_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_prov_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_prov_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_prov_70,
+max(CASE when target between 0.60 and 0.7 then target else 0 end) as m_prov_60,
+max(CASE when target between 0.5 and 0.6 then target else 0 end) as m_prov_50,
+max(CASE when target between 0.4 and 0.5 then target else 0 end) as m_prov_40,
+max(CASE when target between 0.3 and 0.4 then target else 0 end) as m_prov_30,
+max(CASE when target between 0.2 and 0.3 then target else 0 end) as m_prov_20,
+max(CASE when target between 0.1 and 0.2 then target else 0 end) as m_prov_10,
+max(CASE when target < 0.10 then target else 0 end) as m_prov_00,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_prov_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_prov_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_prov_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_prov_70m
+
+from (
+
+select distinct b.patient_id, b.primary_practitioner_id
+ from (
+select distinct patient_id, primary_practitioner_id
+from  genentech.procedure_head
+where primary_practitioner_id <> ''
+UNION
+select distinct patient_id, attending_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+where attending_practitioner_id <> ''
+UNION
+select distinct patient_id, referring_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+where referring_practitioner_id <> ''
+UNION
+select distinct patient_id, ordering_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+   where ordering_practitioner_id <> ''
+UNION
+select distinct patient_id, rendering_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+where rendering_practitioner_id <> ''
+UNION
+select distinct patient_id, operating_practitioner_id as primary_practitioner_id
+from  genentech.procedure_head
+where operating_practitioner_id <> ''
+  
+UNION
+select distinct t1.patient_id, primary_practitioner_id
+from genentech.diagnosis_head as t1
+where primary_practitioner_id <> ''
+  
+UNION
+select distinct t1.patient_id, practitioner_id as primary_practitioner_id
+from genentech.surgical_head as t1
+where practitioner_id <> ''  
+  ) as b
+) as t1
+inner join gj_ref_prov_all as t2 on t1.primary_practitioner_id=t2.primary_practitioner_id
+group by 1
+
+
+#----------------------------------------------------
+#CLAIM_ID FEATURES
+#----------------------------------------------------
+
+#proc-----
+drop table gj_ref_cpt_spec purge
+create table gj_ref_cpt_spec as
+select t1.procedure_code, procedure_description, specialty_description, t2.target, t2. cnt, avg(is_screener) as avg_target, count(distinct t1.patient_id) as cnt_det
+from genentech.procedure_head as t1
+inner join genentech.procedure_code as t5 on t1.procedure_code=t5.procedure_code
+inner join gj_ref_proc_all as t2 on t1.procedure_code=t2.procedure_code
+inner join genentech.physicians as t3 on t1.primary_practitioner_id=t3.practitioner_id
+inner join genentech.patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1,2,3,4,5
+having cnt_det>50
+
+
+create table gj_ref_combo_cpt_spec as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_cpt_spec
+
+
+create table gj_ref_combo_cpt_spec_patients as
+select t1.patient_id, t1.procedure_code, t5.procedure_description,
+t3.specialty_description, t4.code, avg_target as target,
+cnt_det as cnt
+from genentech.procedure_head as t1
+inner join genentech.procedure_code as t5 on t1.procedure_code=t5.procedure_code
+inner join genentech.physicians as t3 on t1.primary_practitioner_id=t3.practitioner_id
+inner join gj_ref_combo_cpt_spec as t4 on t4.procedure_code=t1.procedure_code
+                                        and t4.specialty_description=t3.specialty_description
+
+#dx-----
+drop table gj_ref_dx_spec purge
+create table gj_ref_dx_spec as
+select t1.diagnosis_code, diagnosis_description, specialty_description, 
+t2.target, t2. cnt, avg(is_screener) as avg_target, 
+count(distinct t1.patient_id) as cnt_det
+from genentech.diagnosis_head as t1
+inner join genentech.diagnosis_code as t5 on t1.diagnosis_code=t5.diagnosis_code
+inner join gj_ref_dx_all as t2 on t1.diagnosis_code=t2.diagnosis_code
+inner join genentech.physicians as t3 on t1.primary_practitioner_id=t3.practitioner_id
+inner join patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1,2,3,4,5
+having cnt_det>50
+
+
+create table gj_ref_combo_dx_spec as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_dx_spec
+
+
+create table gj_ref_combo_dx_spec_patients as
+select t1.patient_id, t1.diagnosis_code, t5.diagnosis_description,
+t3.specialty_description, t4.code, avg_target as target,
+cnt_det as cnt
+from genentech.diagnosis_head as t1
+inner join genentech.diagnosis_code as t5 on t1.diagnosis_code=t5.diagnosis_code
+inner join genentech.physicians as t3 on t1.primary_practitioner_id=t3.practitioner_id
+inner join gj_ref_combo_dx_spec as t4 on t4.diagnosis_code=t1.diagnosis_code
+                                        and t4.specialty_description=t3.specialty_description
+
+
+#generate features
+
+drop table gj_feats_combo_target purge
+create table gj_feats_combo_target as
+select patient_id as key_gj_feats_combo_target,
+sum(CASE when target>0.9 then 1 else 0 end) as n_combo_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_combo_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_combo_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_combo_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_combo_70,
+sum(CASE when target between 0.60 and 0.7 then 1 else 0 end) as n_combo_60,
+sum(CASE when target between 0.5 and 0.6 then 1 else 0 end) as n_combo_50,
+sum(CASE when target between 0.4 and 0.5 then 1 else 0 end) as n_combo_40,
+sum(CASE when target between 0.3 and 0.4 then 1 else 0 end) as n_combo_30,
+sum(CASE when target between 0.2 and 0.3 then 1 else 0 end) as n_combo_20,
+sum(CASE when target between 0.1 and 0.2 then 1 else 0 end) as n_combo_10,
+sum(CASE when target < 0.10 then 1 else 0 end) as n_combo_00,
+max(CASE when target>0.9 then target else 0 end) as m_combo_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_combo_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_combo_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_combo_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_combo_70,
+max(CASE when target between 0.60 and 0.7 then target else 0 end) as m_combo_60,
+max(CASE when target between 0.5 and 0.6 then target else 0 end) as m_combo_50,
+max(CASE when target between 0.4 and 0.5 then target else 0 end) as m_combo_40,
+max(CASE when target between 0.3 and 0.4 then target else 0 end) as m_combo_30,
+max(CASE when target between 0.2 and 0.3 then target else 0 end) as m_combo_20,
+max(CASE when target between 0.1 and 0.2 then target else 0 end) as m_combo_10,
+max(CASE when target < 0.10 then target else 0 end) as m_combo_00,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_combo_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_combo_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_combo_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_combo_70m
+
+from (
+  select patient_id, CONCAT('D',code) as code, target, cnt
+  from gj_ref_combo_dx_spec_patients
+  UNION
+  select patient_id, CONCAT('P',code) as code, target, cnt
+  from gj_ref_combo_cpt_spec_patients
+
+  ) as z
+group by 1
+
+#----------------------------------------------------
+#UBER TARGET
+#----------------------------------------------------
+
+#aggregate data
+create table gj_feats_uber_trg as
+select b.patient_id, b.surgical_code as code, r.target,  r.cnt, 'SURG' as type
+from genentech.surgical_head as b
+inner join gj_ref_surg_all as r on r.surgical_code=b.surgical_code
+UNION
+select b.patient_id, b.diagnosis_code as code, r.target, r.cnt, 'DX' as type
+from genentech.diagnosis_head as b
+inner join gj_ref_dx_all as r on r.diagnosis_code=b.diagnosis_code
+UNION
+select b.patient_id, b.procedure_code as code, r.target, r.cnt, 'PROC' as type
+from genentech.procedure_head as b
+inner join gj_ref_proc_all as r on r.procedure_code=b.procedure_code
+
+/*proc_dx*/ 
+insert into table gj_feats_uber_trg
+select t1.patient_id, CONCAT(t1.procedure_code,'_',t1.diagnosis_code) as code, c as target, s as cnt, 'PROC_DX' as type
+from gj_feats_cptdx2all as t1
+inner join gj_feats_cptdx2agg as t2 on t1.diagnosis_code=t2.diagnosis_code and t1.procedure_code=t2.procedure_code
+
+/*prov*/ 
+insert into table gj_feats_uber_trg
+select distinct t1.patient_id, t1.primary_practitioner_id as code, target, cnt, 'PROV' as type
+from
+(select distinct t1.patient_id, primary_practitioner_id
+from genentech.procedure_head as t1
+where primary_practitioner_id <> ''
+UNION
+select distinct t1.patient_id, primary_practitioner_id
+from genentech.diagnosis_head as t1
+where primary_practitioner_id <> ''
+UNION
+select distinct t1.patient_id, practitioner_id as primary_practitioner_id
+from genentech.surgical_head as t1
+where practitioner_id <> ''
+) as t1
+inner join gj_ref_prov_all as t2 on t1.primary_practitioner_id=t2.primary_practitioner_id
+
+
+/*combo dx/proc with spec*/
+insert into table gj_feats_uber_trg
+select distinct t1.patient_id, code, target, cnt, 'COMBO' as type
+
+from (
+  select patient_id, CONCAT('D',code) as code, target, cnt
+  from gj_ref_combo_dx_spec_patients
+  UNION
+  select patient_id, CONCAT('P',code) as code, target, cnt
+  from gj_ref_combo_cpt_spec_patients
+
+  ) as t1
+
+
+/*leakage*/ 
+insert into table gj_feats_uber_trg
+select distinct t1.patient_id, code, target, c as cnt, 'LEAK' as type
+
+from (
+  select t1.patient_id, t3.procedure_code as code, t2.target, t2.c
+  from gj_lk as t1
+  inner join genentech.procedure_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_ref_across as t2 on t3.procedure_code=t2.procedure_code
+  UNION
+  select t1.patient_id, t3.diagnosis_code as code, t2.target, t2.c
+  from gj_lk as t1
+  inner join genentech.diagnosis_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_dx_ref_across as t2 on t3.diagnosis_code=t2.diagnosis_code
+  
+  ) as t1
+
+
+#run the aggregation
+drop table gj_feats_uber_agg_s50 purge
+create table gj_feats_uber_agg_s50 as
+select patient_id as key_gj_feats_uber_agg_s50,
+sum(CASE when target>0.95 then 1 else 0 end) as n_uber_95,
+sum(CASE when target between 0.90 and 0.95 then 1 else 0 end) as n_uber_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_uber_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_uber_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_uber_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_uber_70,
+sum(CASE when target between 0.60 and 0.7 then 1 else 0 end) as n_uber_60,
+sum(CASE when target between 0.5 and 0.6 then 1 else 0 end) as n_uber_50,
+sum(CASE when target between 0.4 and 0.5 then 1 else 0 end) as n_uber_40,
+sum(CASE when target between 0.3 and 0.4 then 1 else 0 end) as n_uber_30,
+sum(CASE when target between 0.2 and 0.3 then 1 else 0 end) as n_uber_20,
+sum(CASE when target between 0.1 and 0.2 then 1 else 0 end) as n_uber_10,
+sum(CASE when target < 0.10 then 1 else 0 end) as n_uber_00,
+max(CASE when target>0.9 then target else 0 end) as m_uber_90,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_uber_85,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_uber_80,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_uber_75,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_uber_70,
+max(CASE when target between 0.60 and 0.7 then target else 0 end) as m_uber_60,
+max(CASE when target between 0.5 and 0.6 then target else 0 end) as m_uber_50,
+max(CASE when target between 0.4 and 0.5 then target else 0 end) as m_uber_40,
+max(CASE when target between 0.3 and 0.4 then target else 0 end) as m_uber_30,
+max(CASE when target between 0.2 and 0.3 then target else 0 end) as m_uber_20,
+max(CASE when target between 0.1 and 0.2 then target else 0 end) as m_uber_10,
+max(CASE when target < 0.10 then target else 0 end) as m_uber_00,
+max(target) as max_uber,
+min(target) as min_uber,
+avg(target) as avg_uber
+from gj_feats_uber_trg
+where cnt>50
+group by 1
+
+
+#----------------------------------------------------
+#MARKET BASKET
+#----------------------------------------------------
+
+#prep the data
+drop table gj_micro_proc purge
+create table gj_micro_proc as
+select distinct t1.patient_id, t1.procedure_code, t1.claim_id
+from genentech.procedure_head as t1
+inner join gj_ref_proc_all as t2 on t1.procedure_code=t2.procedure_code
+  inner join (select patient_id from patient_train_new order by patient_id limit 100000) as t3 on t1.patient_id=t3.patient_id
+  where cnt>500
+
+drop table gj_ref_mb  purge
+create table gj_ref_mb as
+select distinct t1.patient_id, t1.procedure_code, t2.procedure_code as procedure_code2
+from gj_micro_proc as t1
+cross join
+gj_micro_proc as t2
+where t1.patient_id=t2.patient_id
+and t1.procedure_code > t2.procedure_code
+and t1.claim_id=t2.claim_id
+
+create table gj_ref_mb_trg as
+select t1.procedure_code, t1.procedure_code2, t3.target as t_all, t3.cnt as cnt_all,
+t4.target as t_all2, t4.cnt as cnt_all2,
+avg(is_screener) as target, count(distinct t1.patient_id) as cnt
+from gj_ref_mb as t1
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+left join gj_ref_proc_all as t3 on t3.procedure_code=t1.procedure_code
+left join gj_ref_proc_all as t4 on t4.procedure_code=t1.procedure_code2
+group by 1,2,3,4,5,6
+having cnt > 50
+
+#expand to whole population
+drop table gj_macro_proc purge
+create table gj_macro_proc as
+select distinct t1.patient_id, t1.procedure_code, t1.claim_id
+from genentech.procedure_head as t1
+inner join gj_ref_mb_trg as t2 on t1.procedure_code=t2.procedure_code
+where target>0.7
+UNION
+select distinct t1.patient_id, t1.procedure_code, t1.claim_id
+from genentech.procedure_head as t1
+inner join gj_ref_mb_trg as t2 on t1.procedure_code=t2.procedure_code2
+where target>0.7
+
+
+create table gj_macro_proc_reduced as
+select t1.*
+from gj_macro_proc as t1 
+inner join (select claim_id, count(*) as c 
+       from gj_macro_proc group by 1 having c>1) as t2 on t1.claim_id=t2.claim_id
+
+
+drop table gj_ref_mb_patient purge
+create table gj_ref_mb_patient as
+select distinct t1.patient_id, t1.procedure_code, t2.procedure_code as procedure_code2
+from gj_macro_proc_reduced as t1
+cross join
+gj_macro_proc_reduced as t2
+where t1.patient_id=t2.patient_id
+and t1.procedure_code > t2.procedure_code
+and t1.claim_id=t2.claim_id
+
+
+drop table gj_ref_mb_patient_final purge
+create table gj_ref_mb_patient_final as
+select t1.*, t2.target, t2.cnt
+from gj_ref_mb_patient as t1
+inner join gj_ref_mb_trg as t2 on t1.procedure_code=t2.procedure_code
+and t1.procedure_code2=t2.procedure_code2 and t2.target>0.7
+
+#summarize
+drop table gj_feats_mb_target purge
+create table gj_feats_mb_target as
+select patient_id as key_gj_feats_mb_target,
+sum(CASE when target>0.97 then 1 else 0 end) as n_mb_trg_97,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_mb_trg_95,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_mb_trg_90,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_mb_trg_85,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_mb_trg_80,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_mb_trg_75,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_mb_trg_70,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_mb_trg_90m,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_mb_trg_85m,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_mb_trg_80m,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_mb_trg_75m,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_mb_trg_70m,
+max(target) as max_mb_trg,
+min(target) as min_mb_trg,
+avg(target) as avg_mb_trg
+from  gj_ref_mb_patient_final
+group by 1
+
+#----------------------------------------------------
+#PROC DX POS
+#----------------------------------------------------
+
+drop table gj_ref_cpt_dx_pos purge
+create table gj_ref_cpt_dx_pos as 
+select distinct patient_id, f1.procedure_code as code, f1.place_of_service, targetD, cntD
+  from genentech.procedure_head as f1
+  inner join gj_double_leak3 as f2 on f1.procedure_code=f2.procedure_code
+  and f1.place_of_service=f2.place_of_service
+  where cntd>50
+insert into gj_ref_cpt_dx_pos
+select distinct patient_id, f1.diagnosis_code as code, f1.place_of_service, targetD, cntD
+  from gj_ref_dx_pos as f1
+  inner join gj_double_leak4 as f2 on f1.diagnosis_code=f2.diagnosis_code
+  and f1.place_of_service=f2.place_of_service
+  inner join genentech.diagnosis_head as f3 on f3.claim_id=f1.claim_id
+  where cntd>50
+
+
+drop table gj_feats_trg_pos purge
+create table gj_feats_trg_pos as
+select patient_id as key_gj_feats_trg_pos,
+sum(CASE when targetd>0.95 then 1 else 0 end) as n_trgpos_95,
+sum(CASE when targetd between 0.90 and 0.95 then 1 else 0 end) as n_trgpos_90,
+sum(CASE when targetd between 0.85 and 0.9 then 1 else 0 end) as n_trgpos_85,
+sum(CASE when targetd between 0.80 and 0.85 then 1 else 0 end) as n_trgpos_80,
+sum(CASE when targetd between 0.75 and 0.8 then 1 else 0 end) as n_trgpos_75,
+sum(CASE when targetd between 0.70 and 0.75 then 1 else 0 end) as n_trgpos_70,
+sum(CASE when targetd between 0.60 and 0.7 then 1 else 0 end) as n_trgpos_60,
+sum(CASE when targetd between 0.5 and 0.6 then 1 else 0 end) as n_trgpos_50,
+sum(CASE when targetd between 0.4 and 0.5 then 1 else 0 end) as n_trgpos_40,
+sum(CASE when targetd between 0.3 and 0.4 then 1 else 0 end) as n_trgpos_30,
+sum(CASE when targetd between 0.2 and 0.3 then 1 else 0 end) as n_trgpos_20,
+sum(CASE when targetd between 0.1 and 0.2 then 1 else 0 end) as n_trgpos_10,
+sum(CASE when targetd < 0.10 then 1 else 0 end) as n_trgpos_00,
+max(CASE when targetd>0.9 then targetd else 0 end) as m_trgpos_90,
+max(CASE when targetd between 0.85 and 0.9 then targetd else 0 end) as m_trgpos_85,
+max(CASE when targetd between 0.80 and 0.85 then targetd else 0 end) as m_trgpos_80,
+max(CASE when targetd between 0.75 and 0.8 then targetd else 0 end) as m_trgpos_75,
+max(CASE when targetd between 0.70 and 0.75 then targetd else 0 end) as m_trgpos_70,
+max(CASE when targetd between 0.60 and 0.7 then targetd else 0 end) as m_trgpos_60,
+max(CASE when targetd between 0.5 and 0.6 then targetd else 0 end) as m_trgpos_50,
+max(CASE when targetd between 0.4 and 0.5 then targetd else 0 end) as m_trgpos_40,
+max(CASE when targetd between 0.3 and 0.4 then targetd else 0 end) as m_trgpos_30,
+max(CASE when targetd between 0.2 and 0.3 then targetd else 0 end) as m_trgpos_20,
+max(CASE when targetd between 0.1 and 0.2 then targetd else 0 end) as m_trgpos_10,
+max(CASE when targetd < 0.10 then targetd else 0 end) as m_trgpos_00,
+max(targetd) as max_trgpos,
+min(targetd) as min_trgpos,
+avg(targetd) as avg_trgpos
+from gj_ref_cpt_dx_pos
+where cntd>50
+group by 1
+
+#---------------------------------------------------
+#NEW SOURCE OF LEAKEAGE
+#---------------------------------------------------
+
+#look at claims with procs but no dx
+create table gj_mleak as
+select distinct t1.claim_id as clmproc, t1.patient_id patproc, t2.claim_id patdx,
+t2.patient_id as patdx
+from procedure_head as t1
+left join diagnosis_head as t2 on t1.claim_id=t2.claim_id
+
+#average screeners on claims where dx is missing
+select avg(is_screener), count(*)
+from (
+select distinct t2.patient_id, is_screener
+from patient_train_new as t2 
+inner join gj_mleak as t1 on t1.patproc=t2.patient_id
+where t1.patdx is NULL
+
+) as t
+#0.8459683710375151     112k
+
+#average screeners on population where a claim is missing dx and another claim is missing proc
+select avg(is_screener), count(*)
+from (
+select distinct t2.patient_id, is_screener
+from patient_train_new as t2 
+inner join gj_mleak as t1 on t1.patproc=t2.patient_id
+  inner join gj_mleak2 as t3 on t1.patproc=t3.patdx
+where t1.patdx is NULL
+  and t3.patproc is NULL
+) as t
+#0.88574203527620232 83399
+
+#number of missing claims
+select cnt,avg(is_screener), count(*)
+from (
+select patproc, count(*) as cnt
+from gj_mleak 
+ where patdx is NULL
+   group by 1) as t1
+inner join patient_train_new as t2 on t1.patproc=t2.patient_id 
+group by 1
+order by cnt
+
+
+#ref table with claim_ids where dx records are missing
+create table gj_mleakproc as
+select clmproc as claim_id, patproc as patient_id
+from gj_mleak
+where patdx is NULL
+
+#binary indicator of missingness
+drop table gj_feats_leakage_v2 purge
+create table gj_feats_leakage_cnt as
+select b.patient_id, b.nl_cnt_clms
+from (select
+t1.patient_id, count(*) as nl_cnt_clms 
+from gj_mleakproc as t1
+     group by 1) as b
+
+
+drop table gj_feats_leakage_v2 purge
+create table gj_feats_leakage_v2 as
+select b.patient_id as key_gj_feats_leakage_v2, b.nl_cnt_clms,
+CASE WHEN t2.patient_id is NULL then 0 else 1 end as nl_cnt_double
+from gj_feats_leakage_cnt as b
+left join (
+  select distinct t1.patproc as patient_id
+from gj_mleak as t1
+  inner join gj_mleak2 as t3 on t1.patproc=t3.patdx
+where t1.patdx is NULL
+  and t3.patproc is NULL
+  
+  ) as t2 on b.patient_id=t2.patient_id
+
+
+#by spec do OHE
+
+#across claim---------------
+
+#proc
+create table gj_lk_ref_across2 as
+select t2.procedure_code, avg(is_screener) as target, count(distinct t1.patient_id) as c
+from gj_mleakproc as t1
+inner join genentech.procedure_head as t2 on t1.claim_id=t2.claim_id
+inner join genentech.patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+select *
+from gj_lk_ref_across2
+where c>50
+order by target desc
+
+select *
+from gj_errors_impala as t1
+inner join (
+  select distinct t1.patient_id, t3.procedure_code as code, t2.target, t2.c
+  from gj_mleakproc as t1
+  inner join genentech.procedure_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_ref_across2 as t2 on t3.procedure_code=t2.procedure_code
+  where t3.procedure_code in (select distinct procedure_code from gj_lk_ref_across2
+where c>50
+and target >0.98)
+  ) as t2 on t1.patient_id=t2.patient_id
+
+
+#procedures/dx across
+drop table gj_feats_leak_across2 purge
+create table gj_feats_leak_across2 as
+select patient_id as key_gj_feats_leak_across2,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_972,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_952,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_902,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_852,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_802,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_752,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_702,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_602,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_502,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_402,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_302,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_202,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_102,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_002,
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_972,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_952,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_902,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_852,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_802,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_752,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_702,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_602,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_502,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_402,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_302,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_202,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_102,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_002,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m2,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m2,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m2,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m2,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m2,
+max(target) as max_leak_trg2,
+min(target) as min_leak_trg2,
+avg(target) as avg_leak_trg2
+from (
+  select t1.patient_id, t3.procedure_code as code, t2.target, t2.c
+  from gj_mleakproc as t1
+  inner join genentech.procedure_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_ref_across2 as t2 on t3.procedure_code=t2.procedure_code
+  where c>50
+  ) as z
+group by 1
+
+#across claim: by claim_type---------------
+drop table gj_double_leak2 purge
+create table gj_double_leak2 as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_ref_across2 as b
+inner join(
+select procedure_code, claim_type, avg(is_screener) as targetD, 
+  count(distinct t1.patient_id) as cntD
+from gj_mleakproc as t1
+inner join genentech.procedure_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.procedure_code=b.procedure_code
+
+
+drop table gj_double_leak2 purge #not doing this 
+create table gj_double_leak2 as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_dx_ref_across as b
+inner join(
+select diagnosis_code, claim_type, avg(is_screener) as targetD,
+  count(distinct t1.patient_id) as cntD
+from gj_lk as t1
+inner join genentech.diagnosis_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.diagnosis_code=b.diagnosis_code
+
+
+create table gj_lk_ct_patient2 as 
+select t1.patient_id, t1.claim_id, t1.claim_type, t1.procedure_code as code, targetD as target, cntD as cnt
+  from genentech.procedure_head as t1
+  inner join gj_mleakproc as t2 on t1.claim_id=t2.claim_id
+  inner join gj_double_leak2 as t3 on t1.procedure_code=t3.procedure_code and t1.claim_type=t3.claim_type
+  
+
+#procedures/dx across
+drop table gj_feats_leak_across_ct2 purge
+create table gj_feats_leak_across_ct2 as
+select patient_id as key_gj_feats_leak_across_ct2,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_97_ct2,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_95_ct2,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_90_ct2,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_85_ct2,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_80_ct2,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_75_ct2,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_70_ct2,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_60_ct2,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_50_ct2,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_40_ct2,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_30_ct2,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_20_ct2,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_10_ct2,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_00_ct2,
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_97_ct2,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_95_ct2,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_90_ct2,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_85_ct2,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_80_ct2,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_75_ct2,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_70_ct2,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_60_ct2,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_50_ct2,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_40_ct2,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_30_ct2,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_20_ct2,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_10_ct2,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_00_ct2,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m_ct2,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m_ct2,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m_ct2,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m_ct2,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m_ct2,
+max(target) as max_leak_trg_ct2,
+min(target) as min_leak_trg_ct2,
+avg(target) as avg_leak_trg_ct2
+from gj_lk_ct_patient2 as z
+  where z.cnt>50
+group by 1
+
+
+#leakage proc spec
+create table gj_ref_lk_spec_cpt2 as
+select specialty_description, procedure_code,avg(is_Screener) as target, count(distinct t1.patient_id) as cnt
+from genentech.procedure_head as t1
+inner join gj_mleakproc as tt on tt.claim_id=t1.claim_id
+inner join patient_train_new as t3 on t1.patient_id=t3.patient_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+group by 1,2
+
+
+create table gj_ref_lk_spec_cpt_rank2 as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_lk_spec_cpt2
+ 
+
+drop table gj_ref_lk_spec_cpt_patient2 purge
+create table gj_ref_lk_spec_cpt_patient2 as
+select distinct b.*, t4.target, t4.cnt, t4.code
+from (
+select distinct t1.patient_id, specialty_description, procedure_code
+from genentech.procedure_head as t1
+inner join gj_mleakproc as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id) as b
+inner join gj_ref_lk_spec_cpt_rank2 as t4 on t4.procedure_code=b.procedure_code and
+t4.specialty_description=b.specialty_description
+where cnt>50
+
+
+drop table gj_feats_leak_specproc2 purge
+create table gj_feats_leak_specproc2 as
+select patient_id as key_gj_feats_leak_specproc2,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_specproc_972,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_specproc_952,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_specproc_902,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_specproc_852,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_specproc_802,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_specproc_752,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_specproc_702,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_specproc_002,
+max(CASE when target>0.97 then target else 0 end) as m_leak_specproc_972,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_specproc_952,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_specproc_902,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_specproc_852,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_specproc_802,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_specproc_752,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_specproc_702,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_specproc_002,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_specproc_90m2,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_specproc_85m2,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_specproc_80m2,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_specproc_75m2,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_specproc_70m2,
+max(target) as max_leak_specproc2,
+min(target) as min_leak_specproc2,
+avg(target) as avg_leak_specproc2
+from gj_ref_lk_spec_cpt_patient2
+where cnt>50
+group by 1
+
+
+################################################
+#OHE
+###############################################
+
+#leak procs--------------------------------------
+drop table gj_feats_ohe_leak_proc2 purge
+create table gj_feats_ohe_leak_proc2 as 
+select distinct t1.patient_id, t1.procedure_code
+from genentech.procedure_head as t1 
+inner join gj_mleakproc as t3 on t3.claim_id=t1.claim_id
+inner join gj_lk_ref_across2 as t2 on t1.procedure_code=t2.procedure_code
+where t2.c>50 and target>0.7     
+
+drop table gj_feats_ohe_leak_proc_gc2 purge
+create table gj_feats_ohe_leak_proc_gc2 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc2 as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+drop table gj_feats_ohe_leak_proc_gc2_test purge
+create table gj_feats_ohe_leak_proc_gc2_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc2 as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+#leak claim type
+drop table gj_feats_ohe_leak_ct_gc2 purge
+create table gj_feats_ohe_leak_ct_gc2 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient2 where target>0.7 and cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_ct_gc2_test purge
+create table gj_feats_ohe_leak_ct_gc2_test as 
+select t2.patient_id,
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient2 where target>0.7 and cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+#proc place of service
+drop table gj_double_leak32 purge
+create table gj_double_leak32 as
+select b.*, z.place_of_service, z.targetD, z.cntD
+from
+gj_lk_ref_across2 as b
+inner join(
+select procedure_code, place_of_service, avg(is_screener) as targetD, 
+  count(distinct t1.patient_id) as cntD
+from gj_mleakproc as t1
+inner join genentech.procedure_head as t3 on t3.claim_id=t1.claim_id
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.procedure_code=b.procedure_code
+
+
+#train
+drop table gj_feats_ohe_proc_pos_gc2  purge
+create table gj_feats_ohe_proc_pos_gc2 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(concat(procedure_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as procpos
+from (
+  select distinct f1.patient_id, f1.procedure_code, f1.place_of_service 
+  from genentech.procedure_head as f1
+  inner join gj_mleakproc as t4 on t4.claim_id=f1.claim_id
+  inner join gj_double_leak32 as f2 on f1.procedure_code=f2.procedure_code
+  and f1.place_of_service=f2.place_of_service
+  where cntd>50 and targetd>0.7) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_proc_pos_gc_test2 purge
+create table gj_feats_ohe_proc_pos_gc_test2 as 
+select t2.patient_id,
+group_concat(regexp_replace(concat(procedure_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as procpos
+from (
+  select distinct f1.patient_id, f1.procedure_code, f1.place_of_service 
+  from genentech.procedure_head as f1
+  inner join gj_mleakproc as t4 on t4.claim_id=f1.claim_id
+  inner join gj_double_leak32 as f2 on f1.procedure_code=f2.procedure_code
+  and f1.place_of_service=f2.place_of_service
+  where cntd>50 and targetd>0.7) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#spec
+create table gj_ref_spec_leak2 as 
+select specialty_description, avg(is_screener) as target, count(*) as cnt
+from genentech.procedure_head as t1
+inner join gj_mleakproc as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+inner join patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+
+create table gj_ref_spec_leak2_rank as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_spec_leak2
+
+
+drop table gj_ref_spec_leak2_patient purge
+create table gj_ref_spec_leak2_patient as 
+select ref.code, t1.patient_id, target, cnt
+from genentech.procedure_head as t1
+inner join gj_mleakproc as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+inner join gj_ref_spec_leak2_rank as ref on ref.specialty_description=t2.specialty_description
+
+
+create table gj_feats_ohe_specleak_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(code,' ') as specleak2
+from (
+  select * from gj_ref_spec_leak2_patient
+  where cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+create table gj_feats_ohe_specleak_gc_test as 
+select t2.patient_id, 
+group_concat(code,' ') as specleak2
+from (
+  select * from gj_ref_spec_leak2_patient
+  where cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+
+group by 1
+
+
+#----------------------------------------------------------------------
+#look at claims with dx but no procs
+create table gj_mleak2 as
+select distinct t1.claim_id as clmproc, t1.patient_id patproc, t2.claim_id clmdx, 
+t2.patient_id as patdx
+from procedure_head as t1
+right join diagnosis_head as t2 on t1.claim_id=t2.claim_id
+
+
+select * from gj_mleak2
+where patproc is NULL
+limit 100
+
+
+select avg(is_screener), count(*)
+from (
+select distinct t2.patient_id, is_screener, y, pr
+from patient_train_new as t2 
+inner join gj_mleak2 as t1 on t1.patdx=t2.patient_id
+  inner join gj_errors_impala as t3 on t2.patient_id=t3.patient_id
+where t1.patproc is NULL) as t
+
+
+#ref table wit claim_ids where dx records are missing
+drop table gj_mleakdx purge
+create table gj_mleakdx as
+select clmdx as claim_id, patdx as patient_id
+from gj_mleak2
+where patproc is NULL
+
+
+#dx
+create table gj_lk_ref_across3 as
+select t2.diagnosis_code, avg(is_screener) as target, count(distinct t1.patient_id) as c
+from gj_mleakdx as t1
+inner join genentech.diagnosis_head as t2 on t1.claim_id=t2.claim_id
+inner join genentech.patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+
+#procedures/dx across
+drop table gj_feats_leak_across3 purge
+create table gj_feats_leak_across3 as
+select patient_id as key_gj_feats_leak_across3,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_973,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_953,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_903,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_853,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_803,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_753,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_703,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_603,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_503,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_403,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_303,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_203,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_103,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_003,
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_973,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_953,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_903,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_853,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_803,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_753,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_703,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_603,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_503,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_403,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_303,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_203,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_103,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_003,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m3,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m3,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m3,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m3,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m3,
+max(target) as max_leak_trg3,
+min(target) as min_leak_trg3,
+avg(target) as avg_leak_trg3
+from (
+  select t1.patient_id, t3.diagnosis_code as code, t2.target, t2.c
+  from gj_mleakdx as t1
+  inner join genentech.diagnosis_head as t3 on t1.claim_id=t3.claim_id
+  inner join gj_lk_ref_across3 as t2 on t3.diagnosis_code=t2.diagnosis_code
+  where c>50
+  ) as z
+group by 1
+
+
+#across claim: by claim_type---------------
+drop table gj_double_leak3 purge
+create table gj_double_leak3 as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_ref_across3 as b
+inner join(
+select diagnosis_code, claim_type, avg(is_screener) as targetD, 
+  count(distinct t1.patient_id) as cntD
+from gj_mleakdx as t1
+inner join genentech.diagnosis_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.diagnosis_code=b.diagnosis_code
+
+
+drop table gj_double_leak2 purge #not doing this 
+create table gj_double_leak2 as
+select b.*, z.claim_type, z.targetD, z.cntD
+from
+gj_lk_dx_ref_across as b
+inner join(
+select diagnosis_code, claim_type, avg(is_screener) as targetD, count(distinct t1.patient_id) as cntD
+from gj_lk as t1
+inner join genentech.diagnosis_head as t3 on t3.claim_id=t1.claim_id
+inner join genentech.patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.diagnosis_code=b.diagnosis_code
+
+
+create table gj_lk_ct_patient3 as 
+select t1.patient_id, t1.claim_id, t1.claim_type, t1.diagnosis_code as code, targetD as target, cntD as cnt
+  from genentech.diagnosis_head as t1
+  inner join gj_mleakdx as t2 on t1.claim_id=t2.claim_id
+  inner join gj_double_leak3 as t3 on t1.diagnosis_code=t3.diagnosis_code and t1.claim_type=t3.claim_type
+  
+
+#procedures/dx across
+drop table gj_feats_leak_across_ct3 purge
+create table gj_feats_leak_across_ct3 as
+select patient_id as key_gj_feats_leak_across_ct3,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_trg_97_ct3,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_trg_95_ct3,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_trg_90_ct3,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_trg_85_ct3,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_trg_80_ct3,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_trg_75_ct3,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_trg_70_ct3,
+sum(CASE when target between 0.60 and 0.70 then 1 else 0 end) as n_leak_trg_60_ct3,
+sum(CASE when target between 0.50 and 0.60 then 1 else 0 end) as n_leak_trg_50_ct3,
+sum(CASE when target between 0.40 and 0.50 then 1 else 0 end) as n_leak_trg_40_ct3,
+sum(CASE when target between 0.30 and 0.40 then 1 else 0 end) as n_leak_trg_30_ct3,
+sum(CASE when target between 0.20 and 0.30 then 1 else 0 end) as n_leak_trg_20_ct3,
+sum(CASE when target between 0.10 and 0.20 then 1 else 0 end) as n_leak_trg_10_ct3,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_trg_00_ct3,
+max(CASE when target>0.97 then target else 0 end) as m_leak_trg_97_ct3,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_trg_95_ct3,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_trg_90_ct3,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_trg_85_ct3,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_trg_80_ct3,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_trg_75_ct3,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_trg_70_ct3,
+max(CASE when target between 0.60 and 0.70 then target else 0 end) as m_leak_trg_60_ct3,
+max(CASE when target between 0.50 and 0.60 then target else 0 end) as m_leak_trg_50_ct3,
+max(CASE when target between 0.40 and 0.50 then target else 0 end) as m_leak_trg_40_ct3,
+max(CASE when target between 0.30 and 0.40 then target else 0 end) as m_leak_trg_30_ct3,
+max(CASE when target between 0.20 and 0.30 then target else 0 end) as m_leak_trg_20_ct3,
+max(CASE when target between 0.10 and 0.20 then target else 0 end) as m_leak_trg_10_ct3,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_trg_00_ct3,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_trg_90m_ct3,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_trg_85m_ct3,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_trg_80m_ct3,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_trg_75m_ct3,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_trg_70m_ct3,
+max(target) as max_leak_trg_ct3,
+min(target) as min_leak_trg_ct3,
+avg(target) as avg_leak_trg_ct3
+from gj_lk_ct_patient3 as z
+  where z.cnt>50
+group by 1
+
+
+#leakage proc spec
+create table gj_ref_lk_spec_cpt3 as
+select specialty_description, diagnosis_code,avg(is_Screener) as target, count(distinct t1.patient_id) as cnt
+from genentech.diagnosis_head as t1
+inner join gj_mleakdx as tt on tt.claim_id=t1.claim_id
+inner join patient_train_new as t3 on t1.patient_id=t3.patient_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+group by 1,2
+
+
+create table gj_ref_lk_spec_cpt_rank3 as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_lk_spec_cpt3
+ 
+
+drop table gj_ref_lk_spec_cpt_patient3 purge
+create table gj_ref_lk_spec_cpt_patient3 as
+select distinct b.*, t4.target, t4.cnt, t4.code
+from (
+select distinct t1.patient_id, specialty_description, diagnosis_code
+from genentech.diagnosis_head as t1
+inner join gj_mleakdx as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id) as b
+inner join gj_ref_lk_spec_cpt_rank3 as t4 on t4.diagnosis_code=b.diagnosis_code and
+t4.specialty_description=b.specialty_description
+where cnt>50
+
+
+drop table gj_feats_leak_specproc3 purge
+create table gj_feats_leak_specproc3 as
+select patient_id as key_gj_feats_leak_specproc3,
+sum(CASE when target>0.97 then 1 else 0 end) as n_leak_specproc_973,
+sum(CASE when target between 0.95 and 0.97 then 1 else 0 end) as n_leak_specproc_953,
+sum(CASE when target between 0.9 and 0.95 then 1 else 0 end) as n_leak_specproc_903,
+sum(CASE when target between 0.85 and 0.9 then 1 else 0 end) as n_leak_specproc_853,
+sum(CASE when target between 0.80 and 0.85 then 1 else 0 end) as n_leak_specproc_803,
+sum(CASE when target between 0.75 and 0.8 then 1 else 0 end) as n_leak_specproc_753,
+sum(CASE when target between 0.70 and 0.75 then 1 else 0 end) as n_leak_specproc_703,
+sum(CASE when target <0.10 then 1 else 0 end) as n_leak_specproc_003,
+max(CASE when target>0.97 then target else 0 end) as m_leak_specproc_973,
+max(CASE when target between 0.95 and 0.97 then target else 0 end) as m_leak_specproc_953,
+max(CASE when target between 0.9 and 0.95 then target else 0 end) as m_leak_specproc_903,
+max(CASE when target between 0.85 and 0.9 then target else 0 end) as m_leak_specproc_853,
+max(CASE when target between 0.80 and 0.85 then target else 0 end) as m_leak_specproc_803,
+max(CASE when target between 0.75 and 0.8 then target else 0 end) as m_leak_specproc_753,
+max(CASE when target between 0.70 and 0.75 then target else 0 end) as m_leak_specproc_703,
+max(CASE when target < 0.10 then target else 0 end) as m_leak_specproc_003,
+sum(CASE when target > 0.90 then 1 else 0 end) as n_leak_specproc_90m3,
+sum(CASE when target > 0.85 then 1 else 0 end) as n_leak_specproc_85m3,
+sum(CASE when target > 0.80  then 1 else 0 end) as n_leak_specproc_80m3,
+sum(CASE when target > 0.75  then 1 else 0 end) as n_leak_specproc_75m3,
+sum(CASE when target > 0.70 then 1 else 0 end) as n_leak_specproc_70m3,
+max(target) as max_leak_specproc3,
+min(target) as min_leak_specproc3,
+avg(target) as avg_leak_specproc3
+from gj_ref_lk_spec_cpt_patient3
+where cnt>50
+group by 1
+
+################################################
+#OHE
+###############################################
+
+#leak dx--------------------------------------
+drop table gj_feats_ohe_leak_proc3 purge
+create table gj_feats_ohe_leak_proc3 as 
+select distinct t1.patient_id, t1.diagnosis_code
+from genentech.diagnosis_head as t1 
+inner join gj_mleakdx as t3 on t3.claim_id=t1.claim_id
+inner join gj_lk_ref_across3 as t2 on t1.diagnosis_code=t2.diagnosis_code
+where t2.c>50 and target>0.7     
+
+
+drop table gj_feats_ohe_leak_proc_gc3 purge
+create table gj_feats_ohe_leak_proc_gc3 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as lkdx
+from gj_feats_ohe_leak_proc3 as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_proc_gc3_test purge
+create table gj_feats_ohe_leak_proc_gc3_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as lkdx
+from gj_feats_ohe_leak_proc3 as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#leak claim type
+drop table gj_feats_ohe_leak_ct_gc3 purge
+create table gj_feats_ohe_leak_ct_gc3 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient3 where target>0.7 and cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_ct_gc3_test purge
+create table gj_feats_ohe_leak_ct_gc3_test as 
+select t2.patient_id,
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient3 where target>0.7 and cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#spec
+create table gj_ref_spec_leak3 as 
+select specialty_description, avg(is_screener) as target, count(*) as cnt
+from genentech.diagnosis_head as t1
+inner join gj_mleakdx as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+inner join patient_train_new as t4 on t4.patient_id=t1.patient_id
+group by 1
+
+
+create table gj_ref_spec_leak3_rank as
+select *, cast(row_number() over (order by target desc) as string) as code
+from gj_ref_spec_leak3
+
+
+drop table gj_ref_spec_leak3_patient purge
+create table gj_ref_spec_leak3_patient as 
+select ref.code, t1.patient_id, target, cnt
+from genentech.diagnosis_head as t1
+inner join gj_mleakdx as tt on tt.claim_id=t1.claim_id
+left join genentech.physicians as t2 on t2.practitioner_id=t1.primary_practitioner_id
+inner join gj_ref_spec_leak3_rank as ref on ref.specialty_description=t2.specialty_description
+
+
+create table gj_feats_ohe_specleak_gc3 as 
+select t2.patient_id, t2.is_screener, 
+group_concat(code,' ') as specleak3
+from (
+  select * from gj_ref_spec_leak3_patient
+  where cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+create table gj_feats_ohe_specleak_gc3_test as 
+select t2.patient_id, 
+group_concat(code,' ') as specleak3
+from (
+  select * from gj_ref_spec_leak3_patient
+  where cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+
+#----------------------------------------------------
+#ONE HOT ENCODING - these are not actual OHE features.
+#This code creates space separated concatenation of codes,
+#that can later be OHE using CountVectorizer in Python
+#----------------------------------------------------
+
+
+#prov-----------------------------------------
+drop table gj_feats_ohe_prov purge
+create table gj_feats_ohe_prov as
+select distinct t1.patient_id, t1.primary_practitioner_id 
+from ( select distinct t1.patient_id, primary_practitioner_id
+      from genentech.procedure_head as t1 where primary_practitioner_id <> '' 
+      UNION select distinct t1.patient_id, primary_practitioner_id 
+      from genentech.diagnosis_head as t1 where primary_practitioner_id <> ''
+      UNION select distinct t1.patient_id, practitioner_id as primary_practitioner_id 
+      from genentech.surgical_head as t1 where practitioner_id <> '' ) 
+      as t1 
+      inner join gj_ref_prov_all as t2 on t1.primary_practitioner_id=t2.primary_practitioner_id
+      where t2.cnt>50 and (target>0.7 or target <0.2)     
+
+
+drop table gj_feats_ohe_prov_gc purge
+create table gj_feats_ohe_prov_gc as
+select t2.patient_id, t2.is_screener,
+group_concat(regexp_replace(t1.primary_practitioner_id,'\\.',''),' ') as prov 
+from gj_feats_ohe_prov as t1 
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id 
+group by 1,2   
+
+
+drop table gj_feats_ohe_prov_gc_test purge
+create table gj_feats_ohe_prov_gc_test as
+select t2.patient_id,
+group_concat(regexp_replace(t1.primary_practitioner_id,'\\.',''),' ') as prov 
+from gj_feats_ohe_prov as t1 
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id 
+group by 1
+
+
+#proc--------------------------------------
+drop table gj_feats_ohe_proc purge
+create table gj_feats_ohe_proc as
+select distinct t1.patient_id,
+t1.procedure_code 
+from genentech.procedure_head as t1 
+inner join gj_ref_proc_all as t2 on t1.procedure_code=t2.procedure_code 
+where t2.cnt>50 and (target>0.7 or target <0.2)     
+
+
+drop table gj_feats_ohe_proc_gc purge
+create table gj_feats_ohe_proc_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as proc
+from gj_feats_ohe_proc as t1 
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id 
+group by 1,2
+
+
+drop table gj_feats_ohe_proc_gc_test purge
+create table gj_feats_ohe_proc_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as proc
+from gj_feats_ohe_proc as t1 
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id 
+group by 1
+
+
+#dx--------------------------------------
+drop table gj_feats_ohe_dx purge
+create table gj_feats_ohe_dx as 
+select distinct t1.patient_id, t1.diagnosis_code
+from genentech.diagnosis_head as t1 
+inner join gj_ref_dx_all as t2 on t1.diagnosis_code=t2.diagnosis_code
+where t2.cnt>50 and (target>0.7 or target <0.2)       
+
+
+drop table gj_feats_ohe_dx_gc purge
+create table gj_feats_ohe_dx_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as dx
+from gj_feats_ohe_dx as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_dx_gc_test purge
+create table gj_feats_ohe_dx_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as dx
+from gj_feats_ohe_dx as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1  
+ 
+
+#cpt dx----------------------------------------------------
+
+#first generate a base table with unique combinations of members and cpt_dx
+drop table gj_ref_cptdx_v2_pat purge
+create table gj_ref_cptdx_v2_pat as
+select distinct t1.patient_id, concat(procedure_code,'_',diagnosis_code) as cptdx
+from genentech.procedure_head as t1
+inner join genentech.diagnosis_head as t2 on t1.claim_id=t2.claim_id
+
+
+#then look at target
+create table gj_ref_cptdx_v2_ref as
+select cptdx, avg(is_screener) as target, count(distinct t1.patient_id) as cnt
+from gj_ref_cptdx_v2_pat as t1
+inner join patient_train_new as t3 on t3.patient_id=t1.patient_id
+group by cptdx
+
+
+#train
+drop table gj_feats_ohe_cptdx_gc purge
+create table gj_feats_ohe_cptdx_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(tr.cptdx,'\\.',''),' ') as cptdx
+from patient_train_new as t2 
+left join (
+  select distinct t1.patient_id, t1.cptdx 
+  from gj_ref_cptdx_v2_pat as t1
+inner join gj_ref_cptdx_v2_ref as t3 on t3.cptdx=t1.cptdx
+where cnt>100 and target>0.8
+  ) as tr on tr.patient_id=t2.patient_id
+group by 1,2
+
+
+#test
+drop table gj_feats_ohe_cptdx_gc_test purge
+create table gj_feats_ohe_cptdx_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(tr.cptdx,'\\.',''),' ') as cptdx
+from patient_test_new as t2 
+left join (
+  select distinct t1.patient_id, t1.cptdx 
+  from gj_ref_cptdx_v2_pat as t1
+inner join gj_ref_cptdx_v2_ref as t3 on t3.cptdx=t1.cptdx
+where cnt>100 and target>0.8
+  ) as tr on tr.patient_id=t2.patient_id
+group by 1
+
+
+#proc spec
+drop table gj_feats_ohe_cptspec_gc purge
+create table gj_feats_ohe_cptspec_gc as
+select t2.patient_id, t2.is_screener,
+group_concat(code,' ') as cptspec 
+from patient_train_new as t2 
+left join gj_ref_combo_cpt_spec_patients as t1 on t1.patient_id=t2.patient_id 
+and target>0.7 and cnt>50
+group by 1,2   
+
+
+drop table gj_feats_ohe_cptspec_gc_test purge
+create table gj_feats_ohe_cptspec_gc_test as
+select t2.patient_id,
+group_concat(code,' ') as cptspec 
+from patient_test_new as t2 
+left join gj_ref_combo_cpt_spec_patients as t1 on t1.patient_id=t2.patient_id 
+and target>0.7 and cnt>50
+group by 1
+
+
+#dx spec
+drop table gj_feats_ohe_dxspec_gc purge
+create table gj_feats_ohe_dxspec_gc as
+select t2.patient_id, t2.is_screener,
+group_concat(code,' ') as dxspec 
+from patient_train_new as t2 
+left join gj_ref_combo_dx_spec_patients as t1 on t1.patient_id=t2.patient_id 
+and target>0.7 and cnt>50
+group by 1,2   
+
+
+drop table gj_feats_ohe_dxspec_gc_test purge
+create table gj_feats_ohe_dxspec_gc_test as
+select t2.patient_id,
+group_concat(code,' ') as dxspec 
+from patient_test_new as t2 
+left join gj_ref_combo_dx_spec_patients as t1 on t1.patient_id=t2.patient_id 
+and target>0.7 and cnt>50
+group by 1
+
+
+#proc proc
+create table gj_feats_ohe_proc_proc_gc as
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(concat(t1.procedure_code,'_',t1.procedure_code2),'\\.',''),' ') as procproc
+from gj_ref_mb_patient_final as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+create table gj_feats_ohe_proc_proc_gc_test as
+select t2.patient_id,
+group_concat(regexp_replace(concat(t1.procedure_code,'_',t1.procedure_code2),'\\.',''),' ') as procproc
+from gj_ref_mb_patient_final as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#leak procs--------------------------------------
+drop table gj_feats_ohe_leak_proc purge
+create table gj_feats_ohe_leak_proc as 
+select distinct t1.patient_id, t1.procedure_code
+from genentech.procedure_head as t1 
+inner join gj_lk as t3 on t3.claim_id=t1.claim_id
+inner join gj_lk_ref_across as t2 on t1.procedure_code=t2.procedure_code
+where t2.c>50 and target>0.7     
+
+
+drop table gj_feats_ohe_leak_proc_gc purge
+create table gj_feats_ohe_leak_proc_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_proc_gc_test purge
+create table gj_feats_ohe_leak_proc_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+#leak procs--------------------------------------
+drop table gj_feats_ohe_leak_proc purge
+create table gj_feats_ohe_leak_proc as 
+select distinct t1.patient_id, t1.procedure_code
+from genentech.procedure_head as t1 
+inner join gj_lk as t3 on t3.claim_id=t1.claim_id
+inner join gj_lk_ref_across as t2 on t1.procedure_code=t2.procedure_code
+where t2.c>50 and target>0.7     
+
+
+drop table gj_feats_ohe_leak_proc_gc purge
+create table gj_feats_ohe_leak_proc_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_proc_gc_test purge
+create table gj_feats_ohe_leak_proc_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.procedure_code,'\\.',''),' ') as lkproc
+from gj_feats_ohe_leak_proc as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#leak dx--------------------------------------
+drop table gj_feats_ohe_leak_dx purge
+create table gj_feats_ohe_leak_dx as 
+select distinct t1.patient_id, t1.diagnosis_code
+from genentech.diagnosis_head as t1 
+inner join gj_lk as t3 on t3.claim_id=t1.claim_id
+inner join gj_lk_dx_ref_across as t2 on t1.diagnosis_code=t2.diagnosis_code
+where t2.c>50 and target>0.7     
+
+
+drop table gj_feats_ohe_leak_dx_gc purge
+create table gj_feats_ohe_leak_dx_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as lkdx
+from gj_feats_ohe_leak_dx as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_dx_gc_test purge
+create table gj_feats_ohe_leak_dx_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.diagnosis_code,'\\.',''),' ') as lkdx
+from gj_feats_ohe_leak_dx as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#leak claim type
+drop table gj_feats_ohe_leak_ct_gc purge
+create table gj_feats_ohe_leak_ct_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient where target>0.7 and cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_leak_ct_gc_test purge
+create table gj_feats_ohe_leak_ct_gc_test as 
+select t2.patient_id,
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as lkct
+from (select distinct patient_id, code, target, cnt from gj_lk_ct_patient where target>0.7 and cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#proc place of service
+drop table gj_double_leak3 purge
+create table gj_double_leak3 as
+select b.*, z.place_of_service, z.targetD, z.cntD
+from
+gj_lk_ref_across as b
+inner join(
+select procedure_code, place_of_service, avg(is_screener) as targetD, count(distinct t1.patient_id) as cntD
+from gj_lk as t1
+inner join genentech.procedure_head as t3 on t3.claim_id=t1.claim_id
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2) as z on z.procedure_code=b.procedure_code
+
+
+#train
+drop table gj_feats_ohe_proc_pos_gc  purge
+create table gj_feats_ohe_proc_pos_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(concat(procedure_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as procpos
+from (
+  select distinct patient_id, f1.procedure_code, f1.place_of_service 
+  from genentech.procedure_head as f1
+  inner join gj_double_leak3 as f2 on f1.procedure_code=f2.procedure_code
+  and f1.place_of_service=f2.place_of_service
+  where cntd>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+create table gj_feats_ohe_proc_pos_gc_test as 
+select t2.patient_id,
+group_concat(regexp_replace(concat(procedure_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as procpos
+from (
+  select distinct patient_id, f1.procedure_code, f1.place_of_service 
+  from genentech.procedure_head as f1
+  inner join gj_double_leak3 as f2 on f1.procedure_code=f2.procedure_code
+  and f1.place_of_service=f2.place_of_service
+  where cntd>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#place of service - dx ---- SKIP for now
+create table gj_ref_dx_pos as
+select distinct z1.claim_id, diagnosis_code, place_of_service
+            from genentech.diagnosis_head as z1
+            inner join genentech.procedure_head as z2 on z1.claim_id=z2.claim_id
+
+
+drop table gj_double_leak4 purge
+create table gj_double_leak4 as
+select b.*
+from
+(
+select diagnosis_code, place_of_service, avg(is_screener) as targetD, count(distinct t1.patient_id) as cntD
+
+from gj_lk as t1
+inner join gj_ref_dx_pos as t3 on t3.claim_id=t1.claim_id
+inner join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1, 2)
+as b
+
+
+#train
+drop table gj_feats_ohe_dx_pos_gc  purge
+create table gj_feats_ohe_dx_pos_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(concat(diagnosis_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as dxpos
+from (
+  select distinct patient_id, f1.diagnosis_code, f1.place_of_service 
+  from gj_ref_dx_pos as f1
+  inner join gj_double_leak4 as f2 on f1.diagnosis_code=f2.diagnosis_code
+  and f1.place_of_service=f2.place_of_service
+  inner join genentech.diagnosis_head as f3 on f3.claim_id=f1.claim_id
+  where cntd>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_dx_pos_gc_test  purge
+create table gj_feats_ohe_dx_pos_gc_test as 
+select t2.patient_id,
+group_concat(regexp_replace(concat(diagnosis_code,"_",substr(place_of_service,1,3)),'\\.',''),' ') as dxpos
+from (
+  select distinct patient_id, f1.diagnosis_code, f1.place_of_service 
+  from gj_ref_dx_pos as f1
+  inner join gj_double_leak4 as f2 on f1.diagnosis_code=f2.diagnosis_code
+  and f1.place_of_service=f2.place_of_service
+  inner join genentech.diagnosis_head as f3 on f3.claim_id=f1.claim_id
+  where cntd>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#same day leakage
+#train
+drop table gj_feats_ohe_lkprocsd_gc  purge
+create table gj_feats_ohe_lkprocsd_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(t1.procedure_code,' ') as lkprocsd
+from gj_lk_sameday as t1
+inner join gj_lk_ref_sameday as t3 on t1.procedure_code=t3.procedure_code
+and c>50
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_lkprocsd_gc_test  purge
+create table gj_feats_ohe_lkprocsd_gc_test as 
+select t2.patient_id, 
+group_concat(t1.procedure_code,' ') as lkprocsd
+from gj_lk_sameday as t1
+inner join gj_lk_ref_sameday as t3 on t1.procedure_code=t3.procedure_code
+and c>50
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#procspec leakage
+drop table gj_feats_ohe_lk_specproc_gc  purge
+create table gj_feats_ohe_lk_specproc_gc as 
+select t2.patient_id, t2.is_screener, 
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as specproc
+from (select distinct patient_id, code, target, cnt from gj_ref_lk_spec_cpt_patient where target>0.7 and cnt>50) as t1
+right join patient_train_new as t2 on t1.patient_id=t2.patient_id
+group by 1,2
+
+
+drop table gj_feats_ohe_lk_specproc_gc_test  purge
+create table gj_feats_ohe_lk_specproc_gc_test as 
+select t2.patient_id, 
+group_concat(regexp_replace(t1.code,'\\.',''),' ') as specproc
+from (select distinct patient_id, code, target, cnt from gj_ref_lk_spec_cpt_patient where target>0.7 and cnt>50) as t1
+right join patient_test_new as t2 on t1.patient_id=t2.patient_id
+group by 1
+
+
+#----------------------------------------------------
+#ASSEMBLE TRAIN WITH EXCLUSIONS
+#----------------------------------------------------
+
+invalidate metadata;
+drop table gj_train_excl_master purge;
+create table gj_train_excl_master_v9 as
+select *
+from patient_train_new as t1
+left join gj_feats_rx_head as t2 on t1.patient_id=t2.key_gj_feats_rx_head
+left join gj_feats_spec as t3 on t1.patient_id=t3.key_gj_feats_spec
+left join gj_feats_specialties as t4 on t1.patient_id=t4.key_gj_feats_specialties
+left join gj_feats_top_procs t5 on t1.patient_id=t5.key_gj_feats_top_procs
+left join gj_feats_top_procs_all t6 on t1.patient_id=t6.key_gj_feats_top_procs_all
+left join gj_feats_top_dx t7 on t1.patient_id=t7.key_gj_feats_top_dx
+left join gj_feats_top_dx_all t8 on t1.patient_id=t8.key_gj_feats_top_dx_all
+left join gj_feats_leak_det t9 on t1.patient_id=t9.key_gj_feats_leak_det
+left join gj_feats_leak_all t10 on t1.patient_id=t10.key_gj_feats_leak_all
+left join gj_feats_target t11 on t1.patient_id=t11.key_gj_feats_target
+left join gj_feats_procdx_grouped t14 on t1.patient_id=t14.key_gj_feats_procdx_grouped
+left join gj_feats_provs t15 on t1.patient_id=t15.key_gj_feats_provs
+left join gj_feats_combo_target t16 on t1.patient_id=t16.key_gj_feats_combo_target
+left join gj_feats_leak_across t17 on t1.patient_id=t17.key_gj_feats_leak_across
+left join gj_feats_mb_target t18 on t1.patient_id=t18.key_gj_feats_mb_target
+left join gj_feats_uber_agg_s50 t19 on t1.patient_id=t19.key_gj_feats_uber_agg_s50
+left join gj_feats_leak_across_ct t20 on t1.patient_id=t20.key_gj_feats_leak_across_ct
+left join gj_feats_trg_pos t21 on t1.patient_id=t21.key_gj_feats_trg_pos #(up to here to reproduce v6)
+left join gj_feats_leak_sd t22 on t1.patient_id=t22.key_gj_feats_leak_sd
+left join gj_feats_leak_specproc t23 on t1.patient_id=t23.key_gj_feats_leak_specproc
+left join gj_feats_leakage_v2 t24 on t1.patient_id=t24.key_gj_feats_leakage_v2
+left join gj_feats_leak_across2 t25 on t1.patient_id=t25.key_gj_feats_leak_across2
+left join gj_feats_leak_across_ct2 t26 on t1.patient_id=t26.key_gj_feats_leak_across_ct2
+left join gj_feats_leak_specproc2 t27 on t1.patient_id=t27.key_gj_feats_leak_specproc2
+left join gj_feats_leak_across3 t29 on t1.patient_id=t29.key_gj_feats_leak_across3
+left join gj_feats_leak_across_ct3 t30 on t1.patient_id=t30.key_gj_feats_leak_across_ct3
+left join gj_feats_leak_specproc3 t31 on t1.patient_id=t31.key_gj_feats_leak_specproc3 #(up to here to recreate v9)
+
+
+#----------------------------------------------------
+#ASSEMBLE TEST
+#----------------------------------------------------
+
+invalidate metadata;
+drop table gj_test_master_v9 purge;
+create table gj_test_master_v9 as
+select *
+from patient_test_new as t1
+left join gj_feats_rx_head as t2 on t1.patient_id=t2.key_gj_feats_rx_head
+left join gj_feats_spec as t3 on t1.patient_id=t3.key_gj_feats_spec
+left join gj_feats_specialties as t4 on t1.patient_id=t4.key_gj_feats_specialties
+left join gj_feats_top_procs t5 on t1.patient_id=t5.key_gj_feats_top_procs
+left join gj_feats_top_procs_all t6 on t1.patient_id=t6.key_gj_feats_top_procs_all
+left join gj_feats_top_dx t7 on t1.patient_id=t7.key_gj_feats_top_dx
+left join gj_feats_top_dx_all t8 on t1.patient_id=t8.key_gj_feats_top_dx_all
+left join gj_feats_leak_det t9 on t1.patient_id=t9.key_gj_feats_leak_det
+left join gj_feats_leak_all t10 on t1.patient_id=t10.key_gj_feats_leak_all
+left join gj_feats_target t11 on t1.patient_id=t11.key_gj_feats_target
+left join gj_feats_procdx_grouped t14 on t1.patient_id=t14.key_gj_feats_procdx_grouped
+left join gj_feats_provs t15 on t1.patient_id=t15.key_gj_feats_provs
+left join gj_feats_combo_target t16 on t1.patient_id=t16.key_gj_feats_combo_target
+left join gj_feats_leak_across t17 on t1.patient_id=t17.key_gj_feats_leak_across
+left join gj_feats_mb_target t18 on t1.patient_id=t18.key_gj_feats_mb_target
+left join gj_feats_uber_agg_s50 t19 on t1.patient_id=t19.key_gj_feats_uber_agg_s50
+left join gj_feats_leak_across_ct t20 on t1.patient_id=t20.key_gj_feats_leak_across_ct
+left join gj_feats_trg_pos t21 on t1.patient_id=t21.key_gj_feats_trg_pos #(up to here to reproduce v6)
+left join gj_feats_leak_sd t22 on t1.patient_id=t22.key_gj_feats_leak_sd
+left join gj_feats_leak_specproc t23 on t1.patient_id=t23.key_gj_feats_leak_specproc
+left join gj_feats_leakage_v2 t24 on t1.patient_id=t24.key_gj_feats_leakage_v2
+left join gj_feats_leak_across2 t25 on t1.patient_id=t25.key_gj_feats_leak_across2
+left join gj_feats_leak_across_ct2 t26 on t1.patient_id=t26.key_gj_feats_leak_across_ct2
+left join gj_feats_leak_specproc2 t27 on t1.patient_id=t27.key_gj_feats_leak_specproc2
+left join gj_feats_leak_across3 t29 on t1.patient_id=t29.key_gj_feats_leak_across3
+left join gj_feats_leak_across_ct3 t30 on t1.patient_id=t30.key_gj_feats_leak_across_ct3
+left join gj_feats_leak_specproc3 t31 on t1.patient_id=t31.key_gj_feats_leak_specproc3 #(up to here to reproduce v9)

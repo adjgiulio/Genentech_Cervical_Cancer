@@ -1,0 +1,487 @@
+create database genentech;
+
+#------------------------------------------------------------------------------
+# patient_train
+
+DROP TABLE IF EXISTS genentech.imp_patient_train PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_patient_train (
+                                 patient_id string COMMENT "patient id",
+                                 patient_age_group string COMMENT "patient age in 3 years increments",
+                                 patient_gender string COMMENT "gender",
+                                 patient_state string COMMENT "state",
+                                 ethnicity string COMMENT "patient ethnicity where available",
+                                 household_income string COMMENT "patient range household income",
+                                 education_level string COMMENT "patient highest education",
+                                 is_screener int COMMENT "whether or not auser receives regular pap smear"
+  )
+
+COMMENT "PATIENT_TRAIN"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/patient_train'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists patient_train PURGE;
+create table patient_train as
+select * from imp_patient_train;
+
+#------------------------------------------------------------------------------
+# patient_test
+
+DROP TABLE IF EXISTS genentech.imp_patient_test PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_patient_test (
+                                 patient_id string COMMENT "patient id",
+                                 patient_age_group string COMMENT "patient age in 3 years increments",
+                                 patient_gender string COMMENT "gender",
+                                 patient_state string COMMENT "state",
+                                 ethnicity string COMMENT "patient ethnicity where available",
+                                 household_income string COMMENT "patient range household income",
+                                 education_level string COMMENT "patient highest education"
+  )
+
+COMMENT "PATIENT_TEST"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/patient_test'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists patient_test PURGE;
+create table patient_test as
+select * from imp_patient_test;
+
+#------------------------------------------------------------------------------
+# patient_train_exclusions
+
+DROP TABLE IF EXISTS genentech.imp_patient_train_excl PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_patient_train_excl (
+                                 patient_id string COMMENT "patient id"
+                             
+  )
+
+COMMENT "PATIENT_TRAIN_excl"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/train_excl'
+;
+
+drop table if exists patient_train_excl PURGE;
+create table patient_train_excl as
+select * from imp_patient_train_excl;
+
+#------------------------------------------------------------------------------
+# patient_test_exclusions
+
+DROP TABLE IF EXISTS genentech.imp_patient_test_excl PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_patient_test_excl (
+                                 patient_id string COMMENT "patient id"
+                                 
+  )
+
+COMMENT "PATIENT_TEST"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/test_excl'
+;
+
+drop table if exists patient_test_excl PURGE;
+create table patient_test_excl as
+select * from imp_patient_test_excl;
+
+#------------------------------------------------------------------------------
+# drugs
+
+DROP TABLE IF EXISTS genentech.imp_drugs PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_drugs (
+                        drug_id string COMMENT 'Drug ID (Primary Key)',
+                        ndc11 string COMMENT 'NDC11',
+                        drug_name string COMMENT 'Drug Name',
+                        bgi string COMMENT 'Brand Generic Indicator',
+                        bb_usc_code string COMMENT 'Blue Book USC Code',
+                        bb_usc_name string COMMENT 'Blue Book USC Name',
+                        drug_generic_name string COMMENT 'Drug Generic Name',
+                        drug_strength string COMMENT 'Drug Strength',
+                        drug_form string COMMENT 'Drug Form',
+                        package_size string COMMENT 'Quantity Per Package',
+                        package_description string COMMENT 'Description of Package',
+                        manufacturer string COMMENT 'Manufacturer Name',
+                        ndc_start_date timestamp COMMENT 'Date NDC Entered Market'
+
+  )
+
+COMMENT "DRUGS"
+
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+   "separatorChar" = ",",
+   "quoteChar"     = '"',
+   "escapeChar"    = "\\"
+)  
+STORED AS TEXTFILE
+
+LOCATION '/data/drugs'
+tblproperties ("skip.header.line.count"="1")
+
+;
+
+drop table if exists drugs PURGE;
+create table drugs as
+select drug_id ,
+                        ndc11 ,
+                        drug_name,
+                        bgi,
+                        bb_usc_code,
+                        bb_usc_name,
+                        drug_generic_name,
+                        drug_strength,
+                        drug_form,
+                        package_size ,
+                        package_description,
+                        manufacturer ,
+                        cast(ndc_start_date as date) as ndc_start_date
+from imp_drugs
+
+#------------------------------------------------------------------------------
+# diagnoses code
+
+DROP TABLE IF EXISTS genentech.imp_diagnosis_code PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_diagnosis_code (
+                        diagnosis_code string COMMENT 'Diagnosis Code',
+                        diagnosis_description string COMMENT 'Diagnosis Description'
+
+  )
+
+COMMENT "DIAGNOSIS CODE"
+
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+   "separatorChar" = ",",
+   "quoteChar"     = '"',
+   "escapeChar"    = "\\"
+)  
+
+stored as textfile
+LOCATION '/data/diagnosis_code'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists diagnosis_code PURGE;
+create table diagnosis_code as
+select * from imp_diagnosis_code;
+
+#------------------------------------------------------------------------------
+# physicians
+
+DROP TABLE IF EXISTS genentech.imp_physicians PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_physicians (
+                        physician_id string COMMENT 'PRC_REL_GID',
+                        practitioner_id string COMMENT 'DS Writer GID (PRIMARY Key)',
+                        state string COMMENT 'State',
+                        specialty_code string COMMENT 'Specialty Code',
+                        specialty_description string COMMENT 'Specialty Description',
+                        cbsa string COMMENT 'CBSA in which the physician is located'
+
+  )
+
+COMMENT "physicians"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/physicians'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists physicians PURGE;
+create table physicians as
+select * from imp_physicians;
+
+
+
+#------------------------------------------------------------------------------
+# procedure_code
+
+DROP TABLE IF EXISTS genentech.imp_procedure_code PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_procedure_code (
+                        procedure_code string COMMENT 'Procedure Code',
+                        procedure_description string COMMENT 'Procedure Description'
+
+  )
+
+COMMENT "procedure_code"
+
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+   "separatorChar" = ",",
+   "quoteChar"     = '"',
+   "escapeChar"    = "\\"
+)  
+
+stored as textfile
+LOCATION '/data/procedure_code'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists procedure_code purge;
+create table procedure_code as
+select * from imp_procedure_code;
+
+
+#------------------------------------------------------------------------------
+# surgical_code
+
+DROP TABLE IF EXISTS genentech.imp_surgical_code PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_surgical_code (
+                        surgical_code string COMMENT 'Surgical Procedure Code',
+                        surgical_description string COMMENT 'Surgical Procedure Description'
+
+  )
+
+COMMENT "surgical_code"
+
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+   "separatorChar" = ",",
+   "quoteChar"     = '"',
+   "escapeChar"    = "\\"
+)  
+
+stored as textfile
+LOCATION '/data/surgical_code'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists surgical_code purge;
+create table surgical_code as
+select * from imp_surgical_code;
+
+#------------------------------------------------------------------------------
+# surgical_head
+
+DROP TABLE IF EXISTS genentech.imp_surgical_head PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_surgical_head (
+                        patient_id string COMMENT 'Patient ID',
+                        claim_id string COMMENT 'Claim ID',
+                        procedure_type_code string COMMENT 'HXPR or 0001 = Principal Procedure Code
+HX01 or 0002 = Other Procedure Code 1
+HX02 or 0003 = Other procedure Code 2
+HX03 or 0004 = Other Procedure Code 3
+HX04 or 0005 = Other Procedure Code 4
+HX05 or 0006 = Other Procedure Code 5',
+                        claim_type string COMMENT 'Claim Type: UB92 or HX',
+                        surgical_code string COMMENT 'Surgical_code',
+                        surgical_procedure_date string COMMENT 'Year and Month from the Service_From_Date',
+                        place_of_service string COMMENT 'Place of Service',
+                        plan_type string COMMENT 'Plan Type',
+                        practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        primary_physician_role string COMMENT 'Physician Role Code:
+ORD MX Ordering Practitioner
+PRV MX Providing Practitioner
+RFR MX Referring Practitioner
+RND MX Rendering Practitioner
+ATG  HX Attending Physician
+OPR  HX Operating Physician
+UNK Role code Unknown (HX or MX Physician)'
+
+  )
+
+COMMENT "surgical_head"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/surgical_head'
+tblproperties ("skip.header.line.count"="1")
+;
+
+
+drop table if exists surgical_head purge;
+create table surgical_head as
+select *,
+cast(concat(substr(surgical_procedure_date,1,4),"-",substr(surgical_procedure_date,5,2),"-15") as date) as G_surgical_procedure_date
+from imp_surgical_head;
+
+
+#------------------------------------------------------------------------------
+# patient_activity_head
+
+DROP TABLE IF EXISTS genentech.imp_patient_activity_head PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_patient_activity_head (
+                        patient_id string COMMENT 'Patient ID',
+                        activity_type string COMMENT 'Values: A = All Claims, R = Retail Claims Only
+For example, A includes all claims in the database, whereas R includes only claims from a retail pharmacy ',
+                        activity_year string COMMENT 'Year of database activity.  A record will exist in this table if there is activity in the Rx database for the given patient and year combination, based on the given activity type value.',
+                        activity_month string COMMENT 'Month of database activity.  A record will exist in this table if there is activity in the Rx database for the given patient and month combination, based on the given activity type value.  Note this field is associated to the YR field above.'
+
+  )
+
+COMMENT "patient_activity_head"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/patient_activity_head'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists patient_activity_head PURGE;
+create table patient_activity_head as
+select * from imp_patient_activity_head;
+
+#------------------------------------------------------------------------------
+# prescription_head
+
+DROP TABLE IF EXISTS genentech.imp_prescription_head PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_prescription_head (
+                        claim_id string COMMENT 'Claim ID',
+                        patient_id string COMMENT 'Patient ID',
+                        drug_id string COMMENT 'Drug ID',
+                        practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        refill_code string COMMENT '0 = New Rx, else value = Refill Number',
+                        days_supply int COMMENT 'Days Supply',
+                        rx_fill_date string COMMENT 'RX Fill Date',
+                        rx_number string COMMENT 'Encrypted Rx Script Number',
+                        payment_type string COMMENT 'Payment Type for the Rx claim:
+Cash
+Commercial
+Medicare
+Medicaid
+Assistance
+etc.
+Unknown
+NULL'
+
+  )
+
+COMMENT "prescription_head"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/prescription_head'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists prescription_head PURGE;
+create table prescription_head as
+select 
+                        claim_id,
+                        patient_id,
+                        drug_id,
+                        practitioner_id,
+                        refill_code,
+                        days_supply,
+                        cast(rx_fill_date as date) as rx_fill_date,
+                        rx_number,
+                        payment_type
+from imp_prescription_head;
+
+
+
+#------------------------------------------------------------------------------
+# procedure_head
+
+DROP TABLE IF EXISTS genentech.imp_procedure_head PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_procedure_head (
+                        patient_id string COMMENT 'Patient ID',
+                        claim_id string COMMENT 'Claim ID',
+                        claim_line_item string COMMENT 'AKA: SRVC_LINE_SEQ. CLAIM_GID and CLAIM_LINE_ITEM form a composite key.  There are one to many line items for each CLAIM_ID',
+                        claim_type string COMMENT 'Claim Type: HCFA/UB92 or MX/HX',
+                        procedure_code string COMMENT 'Procedure Code',
+                        procedure_date string COMMENT 'Year and Month from the Service_From_Date',
+                        place_of_service string COMMENT 'Place of Service',
+                        plan_type string COMMENT 'Plan Type',
+                        primary_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        units_administered int COMMENT 'Units Administered',
+                        charge_amount double COMMENT 'Amount Charged',
+                        primary_physician_role string COMMENT 'Physician Role Code:ORD MX Ordering Practitioner PRV MX Providing Practitioner RFR MX Referring Practitioner RND MX Rendering Practitioner ATG  HX Attending Physician OPR  HX Operating Physician UNK Role code Unknown (HX or MX Physician)',
+                        attending_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        referring_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        rendering_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        ordering_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        operating_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)'
+
+  )
+
+COMMENT "procedure_head"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/procedure_head'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists procedure_head PURGE;
+create table procedure_head as
+select *,
+                        cast(concat(substr(procedure_date,1,4),"-",substr(procedure_date,5,2),"-15") as date) as G_procedure_date
+
+from imp_procedure_head;
+
+
+#------------------------------------------------------------------------------
+# diagnosis_head
+
+DROP TABLE IF EXISTS genentech.imp_diagnosis_head PURGE;
+
+CREATE EXTERNAL TABLE genentech.imp_diagnosis_head (
+                        patient_id string COMMENT 'Patient ID',
+                        claim_id string COMMENT 'Claim ID',
+                        claim_type string COMMENT 'Claim Type: HCFA/UB92 or MX/HX',
+                        diagnosis_date string COMMENT 'Year and Month from the Service_From_Date',
+                        diagnosis_code string COMMENT 'Diagnosis Code',
+                        primary_practitioner_id string COMMENT 'Practitioner ID (DS_WRITER_GID)',
+                        primary_physician_role string COMMENT 'Physician Role Code:ORD MX Ordering Practitioner PRV MX Providing Practitioner RFR MX Referring Practitioner RND MX Rendering Practitioner ATG  HX Attending Physician OPR  HX Operating Physician UNK Role code Unknown (HX or MX Physician)'
+
+  )
+
+COMMENT "diagnosis_head"
+
+row format delimited
+
+fields terminated by ','
+stored as textfile
+LOCATION '/data/diagnosis_head'
+tblproperties ("skip.header.line.count"="1")
+;
+
+drop table if exists diagnosis_head PURGE;
+create table diagnosis_head as
+select 
+                        *,
+                        cast(concat(substr(diagnosis_date,1,4),"-",substr(diagnosis_date,5,2),"-15") as date) as G_diagnosis_date
+
+
+from imp_diagnosis_head;
